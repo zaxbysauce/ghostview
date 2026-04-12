@@ -1,0 +1,44 @@
+[package]
+name = "ghostview-pro"
+version = "0.1.0"
+edition = "2021"
+description = "GhostView Pro — portable WebRTC screen-share host"
+authors = ["GhostView"]
+
+[lib]
+name = "ghostview_pro_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "ghostview-pro"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+# WebRTC stack — heavy; gated behind feature so scaffold `cargo check` is fast/clean.
+webrtc = { version = "0.11", optional = true }
+bytes = { version = "1", optional = true }
+
+# VP9 software encoder — optional.
+vpx-encode = { version = "0.6", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "1"
+
+[features]
+default = []
+real-webrtc = ["dep:webrtc", "dep:bytes"]
+vpx = ["dep:vpx-encode"]

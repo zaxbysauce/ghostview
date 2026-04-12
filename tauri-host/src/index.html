@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GhostView Pro</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <div class="logo" aria-hidden="true">GV</div>
+        <div class="titles">
+          <h1>GhostView Pro</h1>
+          <p class="subtitle">Portable remote assistance</p>
+        </div>
+        <div class="status" role="status" aria-live="polite">
+          <span id="status-dot" class="status-dot idle"></span>
+          <span id="status-text" class="status-text">Idle</span>
+        </div>
+      </header>
+
+      <section class="panel" aria-labelledby="monitor-label">
+        <label id="monitor-label" for="monitor-select">Monitor</label>
+        <select id="monitor-select" aria-describedby="monitor-help"></select>
+        <p id="monitor-help" class="help">
+          Choose which display to share with the viewer.
+        </p>
+      </section>
+
+      <section
+        id="pin-panel"
+        class="panel pin-panel hidden"
+        aria-labelledby="pin-label"
+      >
+        <div id="pin-label" class="pin-label">Share this code</div>
+        <div
+          id="pin-display"
+          class="pin-display"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          ------
+        </div>
+        <div class="pin-meta">
+          <span id="pin-countdown" class="pin-countdown">--:--</span>
+          <button
+            id="copy-pin"
+            type="button"
+            class="btn btn-ghost"
+            aria-label="Copy PIN to clipboard"
+          >
+            Copy
+          </button>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="start-btn" type="button" class="btn btn-primary">
+          Start Session
+        </button>
+        <button id="stop-btn" type="button" class="btn btn-secondary" disabled>
+          Stop Session
+        </button>
+      </section>
+
+      <p id="error-banner" class="error-banner hidden" role="alert"></p>
+
+      <footer class="app-footer">
+        <span class="build-label">v0.1.0 scaffold</span>
+      </footer>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

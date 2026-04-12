@@ -13,8 +13,10 @@ class SessionManager {
   generatePin() {
     let pin;
     let attempts = 0;
+    // crypto.randomInt(min, max) has an EXCLUSIVE upper bound, so use 1_000_000
+    // to cover the full 100000–999999 range. PINs are always 6 digits.
     do {
-      pin = String(crypto.randomInt(100000, 999999));
+      pin = String(crypto.randomInt(100000, 1_000_000));
       attempts++;
     } while (this.sessions.has(pin) && attempts < 100);
 

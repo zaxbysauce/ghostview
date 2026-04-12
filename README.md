@@ -87,6 +87,10 @@ cargo check --features real-webrtc
 
 # Enable VP9 software encoder:
 cargo check --features vpx
+#   Requires libvpx dev headers installed system-wide:
+#     Debian/Ubuntu: sudo apt install libvpx-dev
+#     macOS (brew):  brew install libvpx
+#     Windows:       vcpkg install libvpx:x64-windows
 
 # Full dev build (Windows only — real native capture):
 cargo tauri dev

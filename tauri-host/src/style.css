@@ -1,0 +1,250 @@
+:root {
+  --bg: #f7f7f9;
+  --surface: #ffffff;
+  --surface-alt: #eef0f4;
+  --border: #d8dbe3;
+  --text: #15171c;
+  --text-muted: #5a6070;
+  --accent: #3952ff;
+  --accent-hover: #2c3fcc;
+  --danger: #c0392b;
+  --success: #2ecc71;
+  --warning: #f39c12;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(16, 20, 32, 0.08),
+    0 4px 12px rgba(16, 20, 32, 0.06);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --surface: #161922;
+    --surface-alt: #1f232e;
+    --border: #2a2f3c;
+    --text: #ececf1;
+    --text-muted: #9aa0b0;
+    --accent: #6078ff;
+    --accent-hover: #7c90ff;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  height: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  min-height: 100vh;
+}
+
+.app-header {
+  display: grid;
+  grid-template-columns: 40px 1fr auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: white;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: 0.5px;
+  font-size: 14px;
+}
+
+.titles h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.subtitle {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--surface-alt);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.status-dot.idle {
+  background: var(--text-muted);
+}
+.status-dot.connecting,
+.status-dot.waiting {
+  background: var(--warning);
+}
+.status-dot.streaming {
+  background: var(--success);
+}
+.status-dot.error {
+  background: var(--danger);
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  box-shadow: var(--shadow);
+}
+
+.panel label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.panel select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.help {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.pin-panel {
+  text-align: center;
+}
+
+.pin-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.pin-display {
+  font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 42px;
+  font-weight: 700;
+  letter-spacing: 8px;
+  padding: 10px 0 6px;
+  color: var(--text);
+}
+
+.pin-meta {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pin-countdown {
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.btn {
+  border: 1px solid transparent;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, transform 0.05s ease;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: white;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-secondary {
+  background: var(--surface-alt);
+  color: var(--text);
+  border-color: var(--border);
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--border);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--accent);
+  padding: 4px 8px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+}
+
+.error-banner {
+  background: rgba(192, 57, 43, 0.12);
+  color: var(--danger);
+  border: 1px solid rgba(192, 57, 43, 0.35);
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  margin: 0;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.app-footer {
+  margin-top: auto;
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-muted);
+}
