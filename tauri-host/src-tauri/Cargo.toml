@@ -28,17 +28,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
-# WebRTC stack — heavy; gated behind feature so scaffold `cargo check` is fast/clean.
-webrtc = { version = "0.11", optional = true }
-bytes = { version = "1", optional = true }
+# WebRTC stack — mandatory. GhostView Pro's job is to establish a peer
+# connection with the viewer; there is no scaffold path.
+webrtc = "0.11"
+bytes = "1"
 
-# VP9 software encoder — optional.
-vpx-encode = { version = "0.6", optional = true }
+# VP9 software encoder — mandatory. Links against system libvpx via
+# `env-libvpx-sys`. Install: `apt install libvpx-dev` (Linux),
+# `brew install libvpx` (macOS), `vcpkg install libvpx:x64-windows` (Windows).
+vpx-encode = { version = "0.6", features = ["vp9"] }
 
+# Real screen capture — Windows only for Phase 1 (macOS/Linux planned).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "1"
 
-[features]
-default = []
-real-webrtc = ["dep:webrtc", "dep:bytes"]
-vpx = ["dep:vpx-encode"]
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }

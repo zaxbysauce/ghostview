@@ -5,11 +5,11 @@
 //! viewer. Non-Windows builds fall back to synthetic capture so the scaffold
 //! can be developed and smoke-tested cross-platform.
 
-mod capture;
-mod codec;
-mod session;
-mod signaling;
-mod webrtc_host;
+pub mod capture;
+pub mod codec;
+pub mod session;
+pub mod signaling;
+pub mod webrtc_host;
 
 use serde::Serialize;
 use session::AppState;

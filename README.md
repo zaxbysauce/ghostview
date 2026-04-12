@@ -79,22 +79,25 @@ cd tauri-host/src-tauri
 cargo check
 ```
 
-The scaffold compiles cross-platform. Real capture and WebRTC are feature-gated:
+The real WebRTC stack and VP9 encoder are always compiled in — there are no feature flags. Prerequisites:
 
 ```bash
-# Enable real WebRTC stack (adds significant compile time + transitive deps):
-cargo check --features real-webrtc
+# libvpx dev headers (required on all platforms):
+sudo apt install libvpx-dev       # Debian/Ubuntu
+brew install libvpx               # macOS
+vcpkg install libvpx:x64-windows  # Windows (set VPX_LIB_DIR/VPX_VERSION if needed)
 
-# Enable VP9 software encoder:
-cargo check --features vpx
-#   Requires libvpx dev headers installed system-wide:
-#     Debian/Ubuntu: sudo apt install libvpx-dev
-#     macOS (brew):  brew install libvpx
-#     Windows:       vcpkg install libvpx:x64-windows
-
-# Full dev build (Windows only — real native capture):
+# Full dev build — Windows only (windows-capture is Windows-gated):
 cargo tauri dev
+
+# Run tests:
+cargo test
+
+# Optional: round-trip the Rust signaling client against the real Node server.
+GHOSTVIEW_NODE_IT=1 cargo test --test signaling_roundtrip
 ```
+
+Pro captures the screen via `windows-capture`; macOS/Linux `start_session` returns `UnsupportedPlatform` on Phase 1 by design.
 
 Before producing a release bundle you must add `icons/icon.ico`, `icon.png`, `32x32.png`, `128x128.png`, and `128x128@2x.png`. See `tauri-host/src-tauri/icons/README.md`.
 

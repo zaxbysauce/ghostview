@@ -1,27 +1,28 @@
 #![allow(dead_code)]
-//! Screen capture abstraction.
+//! Screen capture.
 //!
-//! The scaffold produces synthetic BGRA frames on ALL platforms so the rest of
-//! the pipeline (encoder, WebRTC host, signaling) can be developed and smoke
-//! tested. A Windows-only implementation backed by the `windows-capture` crate
-//! will replace the synthetic producer — that wiring is stubbed below inside
-//! `windows_impl` and clearly marked with TODOs.
+//! Phase 1 target: Windows 10/11 via the `windows-capture` crate (Windows
+//! Graphics Capture API). On non-Windows platforms `start()` / `list_monitors()`
+//! report [`CaptureError::UnsupportedPlatform`] — that is by design; GhostView
+//! Pro ships Windows-only for Phase 1 (macOS/Linux planned).
+//!
+//! Frames are delivered via an mpsc channel as [`RawFrame`] with BGRA bytes.
+//! Encoder and WebRTC layers consume the channel.
 
 use crate::MonitorInfo;
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
-    #[error("screen capture not supported on this platform")]
+    #[error("screen capture is not supported on this platform (Windows-only)")]
     UnsupportedPlatform,
     #[error("capture failed: {0}")]
     Failed(String),
+    #[error("monitor {0} not found")]
+    MonitorNotFound(usize),
 }
 
-/// A raw frame produced by the capture source. Kept deliberately simple for the
-/// scaffold: width + height + BGRA bytes + monotonic presentation timestamp.
+/// Raw captured frame. `bgra` layout is top-down, stride = width*4.
 #[derive(Debug, Clone)]
 pub struct RawFrame {
     pub width: u32,
@@ -30,30 +31,37 @@ pub struct RawFrame {
     pub pts_ms: u64,
 }
 
-/// Opaque handle returned from [`start`]. Dropping it stops capture.
+/// Handle returned by [`start`]. Dropping stops capture; `stop().await` is the
+/// polite tear-down that waits for the producer thread to exit.
 pub struct CaptureHandle {
-    join: Option<JoinHandle<()>>,
-    stop_tx: Option<mpsc::Sender<()>>,
+    #[cfg(target_os = "windows")]
+    inner: Option<windows_impl::Handle>,
+    #[cfg(not(target_os = "windows"))]
+    _phantom: std::marker::PhantomData<()>,
 }
 
 impl CaptureHandle {
     pub async fn stop(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(()).await;
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(handle) = self.inner.take() {
+                handle.stop().await;
+            }
         }
-        if let Some(join) = self.join.take() {
-            let _ = join.await;
+        #[cfg(not(target_os = "windows"))]
+        {
+            // nothing to stop — start() couldn't succeed on this platform
         }
     }
 }
 
 impl Drop for CaptureHandle {
     fn drop(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.try_send(());
-        }
-        if let Some(join) = self.join.take() {
-            join.abort();
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(handle) = self.inner.take() {
+                handle.abort();
+            }
         }
     }
 }
@@ -63,112 +71,225 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
     #[cfg(target_os = "windows")]
     {
         match windows_impl::list_monitors() {
-            Ok(list) if !list.is_empty() => return list,
-            _ => {} // fall through to synthetic
+            Ok(list) => return list,
+            Err(e) => {
+                tracing::warn!(error = %e, "capture: monitor enumeration failed");
+                return vec![];
+            }
         }
     }
-
-    // Non-Windows or Windows fallback: one synthetic virtual display.
-    vec![MonitorInfo {
-        index: 0,
-        name: "Virtual Display".to_string(),
-        width: 1920,
-        height: 1080,
-        is_primary: true,
-    }]
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![]
+    }
 }
 
-/// Start capturing the given monitor. Frames are delivered via `tx`.
-///
-/// For the scaffold this always produces synthetic frames at ~30 FPS. A real
-/// Windows backend will be wired in later.
+/// Start capturing `monitor_index`. Frames are delivered on `tx` until the
+/// returned [`CaptureHandle`] is dropped or `stop().await` is called.
 pub fn start(
     monitor_index: usize,
     tx: mpsc::Sender<RawFrame>,
 ) -> Result<CaptureHandle, CaptureError> {
-    let monitors = list_monitors();
-    let monitor = monitors
-        .into_iter()
-        .find(|m| m.index == monitor_index)
-        .ok_or_else(|| CaptureError::Failed(format!("monitor {monitor_index} not found")))?;
-
-    // TODO: on Windows, replace this with a real `windows-capture` backed
-    // producer driven by the Graphics Capture API. See `windows_impl` module.
-    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-    let width = monitor.width;
-    let height = monitor.height;
-
-    let join = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(33));
-        let mut counter: u64 = 0;
-        let start = std::time::Instant::now();
-        loop {
-            tokio::select! {
-                _ = stop_rx.recv() => break,
-                _ = interval.tick() => {
-                    let frame = synthetic_frame(width, height, counter);
-                    let pts_ms = start.elapsed().as_millis() as u64;
-                    if tx
-                        .send(RawFrame { width, height, bgra: frame, pts_ms })
-                        .await
-                        .is_err()
-                    {
-                        // Receiver dropped; exit quietly.
-                        break;
-                    }
-                    counter = counter.wrapping_add(1);
-                }
-            }
-        }
-    });
-
-    Ok(CaptureHandle {
-        join: Some(join),
-        stop_tx: Some(stop_tx),
-    })
-}
-
-/// Produce a BGRA frame with a simple color gradient + frame counter blob so
-/// downstream encoders can see bytes change per frame. Very small: we fill only
-/// a single solid color to keep allocations bounded.
-fn synthetic_frame(width: u32, height: u32, counter: u64) -> Vec<u8> {
-    // 4 bytes per pixel. For the scaffold we keep this tight: allocate exactly
-    // one row's worth of BGRA bytes, since no consumer actually renders it.
-    // Consumers that need a full frame will be wired up when the real capture
-    // backend lands.
-    let row_bytes = (width as usize).saturating_mul(4);
-    let mut buf = vec![0u8; row_bytes.min(4096)];
-    let b = (counter & 0xFF) as u8;
-    let g = ((counter >> 8) & 0xFF) as u8;
-    let r = ((counter >> 16) & 0xFF) as u8;
-    for px in buf.chunks_exact_mut(4) {
-        px[0] = b;
-        px[1] = g;
-        px[2] = r;
-        px[3] = 0xFF;
+    #[cfg(target_os = "windows")]
+    {
+        let inner = windows_impl::start(monitor_index, tx)?;
+        Ok(CaptureHandle { inner: Some(inner) })
     }
-    // Height is reported for metadata / downstream sizing; we don't fill the
-    // whole frame here to save CPU/memory in the scaffold.
-    let _ = height;
-    buf
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (monitor_index, tx);
+        Err(CaptureError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    //! Real Windows screen capture implementation.
+    //! Real Windows screen capture via the `windows-capture` crate.
     //!
-    //! TODO: wire actual `windows-capture` API. The crate's API surface may
-    //! change between versions; this module intentionally keeps the shape
-    //! minimal and returns an error so non-Windows scaffold development is not
-    //! blocked.
+    //! The crate exposes a `GraphicsCaptureApiHandler` trait. Frames arrive on
+    //! a dedicated capture thread; we copy the BGRA buffer (the underlying
+    //! frame memory is owned by the Graphics Capture API and must not outlive
+    //! the callback) and forward it over an mpsc channel.
 
+    use super::{CaptureError, RawFrame};
     use crate::MonitorInfo;
-    use super::CaptureError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+    use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
+    use windows_capture::frame::Frame;
+    use windows_capture::graphics_capture_api::InternalCaptureControl;
+    use windows_capture::monitor::Monitor;
+    use windows_capture::settings::{
+        ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings,
+    };
+
+    /// State passed into the capture thread.
+    struct Flags {
+        tx: mpsc::Sender<RawFrame>,
+        start: Instant,
+        stopping: Arc<AtomicBool>,
+    }
+
+    /// Handler implementing the capture callbacks.
+    struct Handler {
+        tx: mpsc::Sender<RawFrame>,
+        start: Instant,
+        stopping: Arc<AtomicBool>,
+    }
+
+    impl GraphicsCaptureApiHandler for Handler {
+        type Flags = Flags;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+
+        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            let Flags { tx, start, stopping } = ctx.flags;
+            Ok(Self {
+                tx,
+                start,
+                stopping,
+            })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut Frame<'_>,
+            capture_control: InternalCaptureControl,
+        ) -> Result<(), Self::Error> {
+            if self.stopping.load(Ordering::Relaxed) {
+                capture_control.stop();
+                return Ok(());
+            }
+
+            let width = frame.width();
+            let height = frame.height();
+            // Grab a BGRA buffer. `buffer()` returns a wrapper whose bytes
+            // live only for the frame; copy immediately.
+            let mut buf = frame.buffer()?;
+            let bgra = buf.as_raw_buffer().to_vec();
+            let pts_ms = self.start.elapsed().as_millis() as u64;
+
+            // Non-blocking send: if the consumer is slow, drop rather than
+            // blocking the capture thread (WGC is fragile about reentrancy).
+            let raw = RawFrame {
+                width,
+                height,
+                bgra,
+                pts_ms,
+            };
+            match self.tx.try_send(raw) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!("capture: frame dropped (consumer backpressure)");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    capture_control.stop();
+                }
+            }
+            Ok(())
+        }
+
+        fn on_closed(&mut self) -> Result<(), Self::Error> {
+            tracing::info!("capture: session closed by OS");
+            Ok(())
+        }
+    }
+
+    pub struct Handle {
+        stopping: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Handle {
+        pub async fn stop(mut self) {
+            self.stopping.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                // Join on a blocking thread so we don't stall the tokio runtime.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = t.join();
+                })
+                .await;
+            }
+        }
+
+        pub fn abort(mut self) {
+            self.stopping.store(true, Ordering::Relaxed);
+            // Let the capture thread notice the flag on its next frame and exit.
+            drop(self.thread.take());
+        }
+    }
 
     pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
-        // TODO: enumerate monitors via `windows_capture::monitor::Monitor`.
-        Err(CaptureError::Failed(
-            "windows-capture integration not wired yet".to_string(),
-        ))
+        let monitors = Monitor::enumerate()
+            .map_err(|e| CaptureError::Failed(format!("monitor enumerate: {e:?}")))?;
+        let primary = Monitor::primary().ok();
+
+        let mut out = Vec::with_capacity(monitors.len());
+        for (idx, m) in monitors.into_iter().enumerate() {
+            let width = m.width().unwrap_or(0);
+            let height = m.height().unwrap_or(0);
+            let name = m
+                .device_name()
+                .unwrap_or_else(|_| format!("Monitor {idx}"));
+            let is_primary = primary
+                .as_ref()
+                .map(|p| p.index().ok() == m.index().ok())
+                .unwrap_or(false);
+            out.push(MonitorInfo {
+                index: idx,
+                name,
+                width,
+                height,
+                is_primary,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn start(
+        monitor_index: usize,
+        tx: mpsc::Sender<RawFrame>,
+    ) -> Result<Handle, CaptureError> {
+        let monitors = Monitor::enumerate()
+            .map_err(|e| CaptureError::Failed(format!("monitor enumerate: {e:?}")))?;
+        let monitor = monitors
+            .into_iter()
+            .nth(monitor_index)
+            .ok_or(CaptureError::MonitorNotFound(monitor_index))?;
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let flags = Flags {
+            tx,
+            start: Instant::now(),
+            stopping: Arc::clone(&stopping),
+        };
+
+        let settings = Settings::new(
+            monitor,
+            CursorCaptureSettings::WithCursor,
+            DrawBorderSettings::WithoutBorder,
+            ColorFormat::Bgra8,
+            flags,
+        );
+
+        // `windows-capture` runs the capture loop on the calling thread when
+        // `Handler::start` is invoked. Move it to a dedicated OS thread so the
+        // tokio runtime isn't blocked.
+        let thread = std::thread::Builder::new()
+            .name("ghostview-capture".into())
+            .spawn(move || {
+                if let Err(e) = Handler::start(settings) {
+                    tracing::error!(error = ?e, "capture: session ended with error");
+                } else {
+                    tracing::info!("capture: session ended cleanly");
+                }
+            })
+            .map_err(|e| CaptureError::Failed(format!("spawn: {e}")))?;
+
+        Ok(Handle {
+            stopping,
+            thread: Some(thread),
+        })
     }
 }

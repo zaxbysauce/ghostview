@@ -1,11 +1,13 @@
 #![allow(dead_code)]
-//! VP9 encoder wrapper.
+//! VP9 software encoder.
 //!
-//! With the `vpx` feature enabled, this wraps the `vpx-encode` crate for real
-//! software VP9 encoding. Without the feature (the default for the scaffold),
-//! this is a pass-through encoder that simply returns the raw BGRA bytes
-//! wrapped with a short scaffold header, so downstream pipeline code can be
-//! wired and exercised without pulling in libvpx.
+//! Thin wrapper around [`vpx_encode::Encoder`]. Input is BGRA (as produced by
+//! the Windows Graphics Capture API); we convert to I420 and feed it to libvpx
+//! one frame at a time. Output is the raw VP9 bitstream for the frame —
+//! suitable for [`webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample::write_sample`],
+//! which handles RTP packetization.
+
+use vpx_encode::{Config, Encoder, VideoCodecId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
@@ -13,112 +15,120 @@ pub enum CodecError {
     Init(String),
     #[error("encode failed: {0}")]
     Encode(String),
+    #[error("invalid frame: expected {expected} bytes, got {actual}")]
+    InvalidFrame { expected: usize, actual: usize },
 }
 
-/// VP9 encoder wrapper.
-///
-/// The scaffold implementation (feature `vpx` OFF) does not actually encode:
-/// it just prefixes the raw frame bytes with a small magic header that
-/// includes width/height/pts so consumers can distinguish scaffold payloads
-/// from real VP9 keyframes during development.
 pub struct Vp9Encoder {
     width: u32,
     height: u32,
     bitrate_kbps: u32,
-    #[cfg(feature = "vpx")]
-    inner: vpx_encode::Encoder,
+    inner: Encoder,
+    /// Reusable I420 scratch buffer, sized to the configured frame dimensions.
+    i420_buf: Vec<u8>,
 }
 
 impl Vp9Encoder {
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, CodecError> {
-        #[cfg(feature = "vpx")]
-        {
-            let config = vpx_encode::Config {
-                width,
-                height,
-                timebase: [1, 1000],
-                bitrate: bitrate_kbps,
-                codec: vpx_encode::VideoCodecId::VP9,
-            };
-            let inner = vpx_encode::Encoder::new(config)
-                .map_err(|e| CodecError::Init(format!("{e:?}")))?;
-            return Ok(Self {
-                width,
-                height,
-                bitrate_kbps,
-                inner,
-            });
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            return Err(CodecError::Init(format!(
+                "width/height must be non-zero and even: got {width}x{height}"
+            )));
         }
 
-        #[cfg(not(feature = "vpx"))]
-        {
-            tracing::warn!(
-                "Vp9Encoder: `vpx` feature disabled — returning pass-through scaffold encoder"
-            );
-            Ok(Self {
-                width,
-                height,
-                bitrate_kbps,
-            })
-        }
+        let config = Config {
+            width,
+            height,
+            timebase: [1, 1000], // milliseconds
+            bitrate: bitrate_kbps,
+            codec: VideoCodecId::VP9,
+        };
+        let inner = Encoder::new(config).map_err(|e| CodecError::Init(format!("{e:?}")))?;
+
+        let i420_len = i420_buffer_len(width as usize, height as usize);
+
+        Ok(Self {
+            width,
+            height,
+            bitrate_kbps,
+            inner,
+            i420_buf: vec![0u8; i420_len],
+        })
     }
 
     pub fn width(&self) -> u32 {
         self.width
     }
-
     pub fn height(&self) -> u32 {
         self.height
     }
-
     pub fn bitrate_kbps(&self) -> u32 {
         self.bitrate_kbps
     }
 
-    /// Encode a single BGRA frame. The scaffold wraps raw bytes with a tiny
-    /// header `[b"GVSCAF", width:u32, height:u32, pts:u64]` and returns them
-    /// as "encoded" output. The real encoder (feature `vpx`) converts BGRA to
-    /// I420 and feeds it into libvpx.
+    /// Encode one BGRA frame. Returns the concatenated VP9 bitstream bytes
+    /// emitted for this input (usually one packet, occasionally zero while
+    /// libvpx buffers, occasionally more than one at resolution changes).
     pub fn encode(&mut self, bgra_frame: &[u8], pts_ms: u64) -> Result<Vec<u8>, CodecError> {
-        #[cfg(feature = "vpx")]
-        {
-            // Convert BGRA to I420 for VP9.
-            let yuv = bgra_to_i420(bgra_frame, self.width, self.height)
-                .ok_or_else(|| CodecError::Encode("BGRA->I420 conversion failed".into()))?;
-            let packets = self
-                .inner
-                .encode(pts_ms as i64, &yuv)
-                .map_err(|e| CodecError::Encode(format!("{e:?}")))?;
-            let mut out = Vec::new();
-            for pkt in packets {
-                out.extend_from_slice(&pkt.data);
-            }
-            return Ok(out);
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let expected = w * h * 4;
+        if bgra_frame.len() < expected {
+            return Err(CodecError::InvalidFrame {
+                expected,
+                actual: bgra_frame.len(),
+            });
         }
 
-        #[cfg(not(feature = "vpx"))]
-        {
-            let mut out = Vec::with_capacity(bgra_frame.len() + 24);
-            out.extend_from_slice(b"GVSCAF");
-            out.extend_from_slice(&self.width.to_le_bytes());
-            out.extend_from_slice(&self.height.to_le_bytes());
-            out.extend_from_slice(&pts_ms.to_le_bytes());
-            out.extend_from_slice(bgra_frame);
-            Ok(out)
+        bgra_to_i420_into(bgra_frame, w, h, &mut self.i420_buf);
+
+        let packets = self
+            .inner
+            .encode(pts_ms as i64, &self.i420_buf)
+            .map_err(|e| CodecError::Encode(format!("{e:?}")))?;
+
+        // Concatenate packet payloads into one buffer. For VP9 each packet is
+        // already a complete encoded frame; concatenating is a no-op when only
+        // one packet is emitted (the common case).
+        let mut out = Vec::new();
+        for pkt in packets {
+            out.extend_from_slice(&pkt.data);
         }
+        Ok(out)
+    }
+
+    /// Flush any buffered frames at end-of-stream.
+    pub fn finish(self) -> Result<Vec<u8>, CodecError> {
+        let mut fin = self
+            .inner
+            .finish()
+            .map_err(|e| CodecError::Encode(format!("{e:?}")))?;
+        let mut out = Vec::new();
+        // `Finish::next()` -> Result<Option<Frame>>; drain until None.
+        loop {
+            match fin.next() {
+                Ok(Some(frame)) => out.extend_from_slice(&frame.data),
+                Ok(None) => break,
+                Err(e) => return Err(CodecError::Encode(format!("{e:?}"))),
+            }
+        }
+        Ok(out)
     }
 }
 
-#[cfg(feature = "vpx")]
-fn bgra_to_i420(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    let w = width as usize;
-    let h = height as usize;
-    if bgra.len() < w * h * 4 {
-        return None;
-    }
+/// I420 (a.k.a. YUV 4:2:0 planar) buffer length for `w x h`.
+fn i420_buffer_len(w: usize, h: usize) -> usize {
+    // Y plane: w * h, then U and V each at half resolution in both dimensions.
+    w * h + 2 * ((w / 2) * (h / 2))
+}
+
+/// BGRA → I420 (BT.601 studio-range). Writes into `out`, which must be at least
+/// `i420_buffer_len(w, h)` bytes long.
+fn bgra_to_i420_into(bgra: &[u8], w: usize, h: usize, out: &mut [u8]) {
     let y_size = w * h;
     let uv_size = (w / 2) * (h / 2);
-    let mut out = vec![0u8; y_size + 2 * uv_size];
+    debug_assert!(out.len() >= y_size + 2 * uv_size);
+
     let (y_plane, uv) = out.split_at_mut(y_size);
     let (u_plane, v_plane) = uv.split_at_mut(uv_size);
 
@@ -128,8 +138,11 @@ fn bgra_to_i420(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
             let b = bgra[idx] as i32;
             let g = bgra[idx + 1] as i32;
             let r = bgra[idx + 2] as i32;
+            // BT.601 studio-range coefficients, integer-math form used by libyuv.
             let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
             y_plane[j * w + i] = y.clamp(0, 255) as u8;
+
+            // 4:2:0 subsampling — write one U/V per 2x2 block.
             if j % 2 == 0 && i % 2 == 0 {
                 let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
                 let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
@@ -139,5 +152,29 @@ fn bgra_to_i420(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
             }
         }
     }
-    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn i420_len_matches_formula() {
+        assert_eq!(i420_buffer_len(1920, 1080), 1920 * 1080 * 3 / 2);
+        assert_eq!(i420_buffer_len(320, 240), 320 * 240 * 3 / 2);
+    }
+
+    #[test]
+    fn rejects_odd_dimensions() {
+        assert!(Vp9Encoder::new(1921, 1080, 2000).is_err());
+        assert!(Vp9Encoder::new(1920, 1081, 2000).is_err());
+        assert!(Vp9Encoder::new(0, 1080, 2000).is_err());
+    }
+
+    #[test]
+    fn rejects_short_frame() {
+        let mut enc = Vp9Encoder::new(320, 240, 500).expect("encoder");
+        let result = enc.encode(&vec![0u8; 10], 0);
+        assert!(matches!(result, Err(CodecError::InvalidFrame { .. })));
+    }
 }
