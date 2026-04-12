@@ -122,7 +122,8 @@ mod windows_impl {
     use windows_capture::graphics_capture_api::InternalCaptureControl;
     use windows_capture::monitor::Monitor;
     use windows_capture::settings::{
-        ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings,
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     };
 
     /// State passed into the capture thread.
@@ -166,8 +167,12 @@ mod windows_impl {
             let height = frame.height();
             // Grab a BGRA buffer. `buffer()` returns a wrapper whose bytes
             // live only for the frame; copy immediately.
+            //
+            // `as_nopadding_buffer` strips any row padding the GPU added so the
+            // slice is exactly `width * height * 4` bytes — which is what the
+            // encoder expects (stride == width*4).
             let mut buf = frame.buffer()?;
-            let bgra = buf.as_raw_buffer().to_vec();
+            let bgra = buf.as_nopadding_buffer()?.to_vec();
             let pts_ms = self.start.elapsed().as_millis() as u64;
 
             // Non-blocking send: if the consumer is slow, drop rather than
@@ -269,6 +274,9 @@ mod windows_impl {
             monitor,
             CursorCaptureSettings::WithCursor,
             DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
             flags,
         );

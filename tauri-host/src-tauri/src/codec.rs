@@ -30,7 +30,7 @@ pub struct Vp9Encoder {
 
 impl Vp9Encoder {
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, CodecError> {
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(CodecError::Init(format!(
                 "width/height must be non-zero and even: got {width}x{height}"
             )));
@@ -92,7 +92,7 @@ impl Vp9Encoder {
         // one packet is emitted (the common case).
         let mut out = Vec::new();
         for pkt in packets {
-            out.extend_from_slice(&pkt.data);
+            out.extend_from_slice(pkt.data);
         }
         Ok(out)
     }
@@ -107,7 +107,7 @@ impl Vp9Encoder {
         // `Finish::next()` -> Result<Option<Frame>>; drain until None.
         loop {
             match fin.next() {
-                Ok(Some(frame)) => out.extend_from_slice(&frame.data),
+                Ok(Some(frame)) => out.extend_from_slice(frame.data),
                 Ok(None) => break,
                 Err(e) => return Err(CodecError::Encode(format!("{e:?}"))),
             }
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn rejects_short_frame() {
         let mut enc = Vp9Encoder::new(320, 240, 500).expect("encoder");
-        let result = enc.encode(&vec![0u8; 10], 0);
+        let result = enc.encode(&[0u8; 10], 0);
         assert!(matches!(result, Err(CodecError::InvalidFrame { .. })));
     }
 }

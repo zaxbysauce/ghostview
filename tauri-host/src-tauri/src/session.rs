@@ -1,7 +1,12 @@
 #![allow(dead_code)]
 //! Session orchestration.
 //!
-//! [`AppState`] owns the current session. `start()` wires the full pipeline:
+//! [`AppState`] owns the current session as an `Arc<Mutex<Option<Running>>>`
+//! so that a supervisor task spawned by `start()` can tear the session down
+//! autonomously when the remote peer disconnects, the signaling server
+//! expires the session, or the peer connection fails.
+//!
+//! `start()` wires the full pipeline:
 //!
 //!   capture → encoder → WebRTC video track
 //!             signaling ⇄ WebRTC SDP/ICE
@@ -15,16 +20,14 @@
 //!    it. Local ICE candidates are relayed to signaling as they trickle.
 //! 4. Apply the viewer's SDP answer; apply incoming ICE candidates.
 //! 5. On `peer-disconnected` / `session-expired` / connection `Failed` or
-//!    `Closed`, tear the session down.
-//!
-//! `stop()` performs the reverse: send `end-session`, close signaling, close
-//! the peer connection, stop capture, and wait briefly for the encoder task
-//! to exit.
+//!    `Closed`, the supervisor takes the `Running` out of the slot and runs
+//!    the same teardown path that `stop()` runs — so the UI returns to the
+//!    idle state exactly as if the user had clicked stop.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
@@ -77,42 +80,82 @@ pub fn ice_servers() -> Vec<RTCIceServer> {
     }]
 }
 
+/// The live session. Owns every task and resource. `teardown()` runs the
+/// unwind exactly once.
 struct Running {
     pin: String,
     capture: CaptureHandle,
-    encoder_task: JoinHandle<()>,
+    /// Async forwarder: drains encoded packets → WebRTC track.
+    encoder_forwarder: JoinHandle<()>,
+    /// Blocking libvpx encoder loop. It exits when the frame_rx it owns
+    /// closes (on capture stop). We still track and join it.
+    encoder_blocking: Option<tokio::task::JoinHandle<()>>,
     signaling_task: JoinHandle<()>,
     ice_forward_task: JoinHandle<()>,
     state_task: JoinHandle<()>,
     signaling: SignalingClient,
     webrtc: Arc<WebRtcHost>,
-    /// Triggered when the session ends from the *remote* side (server,
-    /// viewer, or peer connection). `stop()` is expected to tolerate being
-    /// called either way.
-    shutdown_tx: mpsc::Sender<()>,
 }
 
+impl Running {
+    /// Consume and tear down, in order:
+    ///   1. Tell signaling to end-session (best effort), close the socket.
+    ///   2. Stop capture (halts the frame pipeline at the source).
+    ///   3. Close the peer connection.
+    ///   4. Await task exit with a bounded timeout; abort if they hang.
+    async fn teardown(mut self) {
+        let _ = self.signaling.send(ClientMessage::EndSession).await;
+        self.signaling.close().await;
+
+        self.capture.stop().await;
+
+        if let Err(e) = self.webrtc.close().await {
+            tracing::warn!(error = %e, "webrtc: close failed");
+        }
+
+        abort_after(self.encoder_forwarder, Duration::from_millis(500)).await;
+        if let Some(h) = self.encoder_blocking.take() {
+            // The blocking encoder loop exits when frame_rx closes (capture
+            // stopped above), so a short join window is sufficient.
+            abort_after(h, Duration::from_millis(1000)).await;
+        }
+        abort_after(self.signaling_task, Duration::from_millis(500)).await;
+        abort_after(self.ice_forward_task, Duration::from_millis(200)).await;
+        abort_after(self.state_task, Duration::from_millis(200)).await;
+    }
+}
+
+/// Shared session slot. `AppState` hands a clone to the supervisor task so the
+/// session can self-terminate on remote shutdown without deadlocking the
+/// outer `AppState` lock.
+type Slot = Arc<Mutex<Option<Running>>>;
+
 pub struct AppState {
-    running: Option<Running>,
+    slot: Slot,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        Self { running: None }
+        Self {
+            slot: Arc::new(Mutex::new(None)),
+        }
     }
 
-    pub fn is_running(&self) -> bool {
-        self.running.is_some()
+    pub async fn is_running(&self) -> bool {
+        self.slot.lock().await.is_some()
     }
 
-    pub fn current_pin(&self) -> Option<&str> {
-        self.running.as_ref().map(|r| r.pin.as_str())
+    pub async fn current_pin(&self) -> Option<String> {
+        self.slot.lock().await.as_ref().map(|r| r.pin.clone())
     }
 
     /// Start a new session. Returns the 6-digit PIN the viewer will enter.
     pub async fn start(&mut self, monitor_index: usize) -> Result<String, SessionError> {
-        if self.running.is_some() {
-            return Err(SessionError::AlreadyRunning);
+        {
+            let guard = self.slot.lock().await;
+            if guard.is_some() {
+                return Err(SessionError::AlreadyRunning);
+            }
         }
 
         // --- Signaling: connect + get PIN --------------------------------------
@@ -130,15 +173,16 @@ impl AppState {
         let capture = capture::start(monitor_index, frame_tx)?;
 
         // Pick encoder dimensions from the chosen monitor, defaulting to 1080p.
-        // (On non-Windows this is academic — capture::start already returned
-        // UnsupportedPlatform.)
+        // The encoder task will auto-reinit if the actual capture resolution
+        // differs (e.g. mixed-DPI monitors or post-start display changes).
         let (w, h) = capture::list_monitors()
             .into_iter()
             .find(|m| m.index == monitor_index)
             .map(|m| (even(m.width, 1920), even(m.height, 1080)))
             .unwrap_or((1920, 1080));
 
-        let encoder_task = spawn_encoder_task(w, h, frame_rx, Arc::clone(&webrtc));
+        let (encoder_blocking, encoder_forwarder) =
+            spawn_encoder_pair(w, h, frame_rx, Arc::clone(&webrtc));
 
         // --- Signaling pumps ---------------------------------------------------
         let events = client
@@ -152,7 +196,9 @@ impl AppState {
             ))
         })?;
 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(2);
+        // Single shutdown signal with two senders (signaling loop + state
+        // watcher) and one receiver (the supervisor).
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<&'static str>(4);
 
         let signaling_task = spawn_signaling_loop(
             events,
@@ -173,31 +219,41 @@ impl AppState {
         })?;
         let state_task = spawn_state_watcher(state_rx, shutdown_tx.clone());
 
-        // Tie remote-shutdown signal into a watcher that drops us cleanly.
-        // Hold the receiver by moving it into a task that just logs on wake;
-        // the actual teardown happens when `stop()` is called by the UI or
-        // when AppState is dropped. For automatic unwind-on-remote-close we
-        // spawn a supervisor: on the first shutdown tick, tear the session
-        // down by sending a synthetic stop via a channel back to AppState.
-        // Phase 1 keeps this simple: we just log, because the signaling/ICE
-        // tasks exit cleanly on their own and the UI polls state.
+        // Install Running in the slot.
+        {
+            let mut guard = self.slot.lock().await;
+            *guard = Some(Running {
+                pin: pin.clone(),
+                capture,
+                encoder_forwarder,
+                encoder_blocking: Some(encoder_blocking),
+                signaling_task,
+                ice_forward_task,
+                state_task,
+                signaling: client,
+                webrtc,
+            });
+        }
+
+        // Supervisor: on first shutdown signal, take the Running out of the
+        // slot and run teardown. This is what `stop()` would do — so the
+        // state afterwards is indistinguishable from a user-initiated stop.
+        let slot_for_sup = Arc::clone(&self.slot);
         tokio::spawn(async move {
             let mut rx = shutdown_rx;
-            if rx.recv().await.is_some() {
-                tracing::info!("session: shutdown signaled (remote peer / state change)");
+            let reason = rx.recv().await.unwrap_or("unknown");
+            tracing::info!(%reason, "session: remote shutdown — tearing down");
+            let taken = {
+                let mut guard = slot_for_sup.lock().await;
+                guard.take()
+            };
+            if let Some(running) = taken {
+                running.teardown().await;
+                tracing::info!("session: teardown complete (remote)");
             }
-        });
-
-        self.running = Some(Running {
-            pin: pin.clone(),
-            capture,
-            encoder_task,
-            signaling_task,
-            ice_forward_task,
-            state_task,
-            signaling: client,
-            webrtc,
-            shutdown_tx,
+            // If the slot was already None, `stop()` beat us to it — nothing
+            // to do. Drop the remaining shutdown_tx clones held by the
+            // signaling/state tasks; their sends will be no-ops.
         });
 
         Ok(pin)
@@ -206,31 +262,15 @@ impl AppState {
     /// Stop the current session. Tears every task down in order. Returns
     /// `NotRunning` if there's nothing active.
     pub async fn stop(&mut self) -> Result<(), SessionError> {
-        let Some(mut running) = self.running.take() else {
+        let taken = {
+            let mut guard = self.slot.lock().await;
+            guard.take()
+        };
+        let Some(running) = taken else {
             return Err(SessionError::NotRunning);
         };
-
-        // Best-effort: tell the server. If the socket is already gone it's fine.
-        let _ = running.signaling.send(ClientMessage::EndSession).await;
-        running.signaling.close().await;
-
-        // Stop capture first so no more frames queue up.
-        running.capture.stop().await;
-
-        // Close peer connection.
-        if let Err(e) = running.webrtc.close().await {
-            tracing::warn!(error = %e, "webrtc: close failed");
-        }
-
-        // Signal any waiters (no-op if already drained).
-        let _ = running.shutdown_tx.try_send(());
-
-        // Wait briefly for tasks to exit; abort if they don't.
-        abort_after(running.encoder_task, Duration::from_millis(500)).await;
-        abort_after(running.signaling_task, Duration::from_millis(500)).await;
-        abort_after(running.ice_forward_task, Duration::from_millis(200)).await;
-        abort_after(running.state_task, Duration::from_millis(200)).await;
-
+        running.teardown().await;
+        tracing::info!("session: teardown complete (local stop)");
         Ok(())
     }
 }
@@ -249,38 +289,67 @@ impl Default for AppState {
 ///
 /// `vpx_encode::Encoder` is `!Send` (holds raw libvpx pointers), so the
 /// encode loop lives on a dedicated blocking thread. Encoded packets are
-/// handed to an async forwarder task that pushes them into the WebRTC track.
-/// The returned `JoinHandle` is for the async forwarder; the blocking thread
-/// is orphaned — it exits when `frame_rx` closes (i.e. capture stops).
-fn spawn_encoder_task(
-    width: u32,
-    height: u32,
+/// handed to an async forwarder that pushes them into the WebRTC track.
+///
+/// Returns `(blocking_handle, forwarder_handle)` — both are tracked by
+/// `Running` so teardown can join them.
+///
+/// The blocking loop auto-reinitializes the encoder when the incoming frame
+/// resolution differs from the configured size (e.g. mixed-DPI scenarios,
+/// display mode changes after start). A reinit forces the next frame to be
+/// a keyframe by virtue of libvpx being freshly constructed.
+fn spawn_encoder_pair(
+    initial_width: u32,
+    initial_height: u32,
     mut frame_rx: mpsc::Receiver<RawFrame>,
     webrtc: Arc<WebRtcHost>,
-) -> JoinHandle<()> {
+) -> (JoinHandle<()>, JoinHandle<()>) {
     let (enc_tx, mut enc_rx) = mpsc::channel::<(Vec<u8>, u64)>(4);
 
-    tokio::task::spawn_blocking(move || {
-        let mut encoder = match Vp9Encoder::new(width, height, 4_000) {
-            Ok(e) => e,
+    let blocking = tokio::task::spawn_blocking(move || {
+        let mut cur_w = initial_width;
+        let mut cur_h = initial_height;
+        let mut encoder = match Vp9Encoder::new(cur_w, cur_h, 4_000) {
+            Ok(e) => Some(e),
             Err(e) => {
                 tracing::error!(error = %e, "encoder: init failed");
-                return;
+                None
             }
         };
         let mut last_pts: u64 = 0;
+
         while let Some(frame) = frame_rx.blocking_recv() {
-            if frame.width != width || frame.height != height {
-                tracing::warn!(
-                    "encoder: frame {}x{} ignored (configured {}x{})",
-                    frame.width,
-                    frame.height,
-                    width,
-                    height
-                );
-                continue;
+            // Dimension change → reinit. WGC can deliver odd sizes after DPI
+            // changes; normalise to even as libvpx requires.
+            let fw = even(frame.width, cur_w);
+            let fh = even(frame.height, cur_h);
+            if fw != cur_w || fh != cur_h || encoder.is_none() {
+                // Drop the old encoder (and its libvpx state) first to free
+                // GPU-sized allocations before constructing the new one.
+                encoder = None;
+                match Vp9Encoder::new(fw, fh, 4_000) {
+                    Ok(e) => {
+                        tracing::info!(
+                            from = format!("{cur_w}x{cur_h}"),
+                            to = format!("{fw}x{fh}"),
+                            "encoder: reinitialized for new resolution"
+                        );
+                        cur_w = fw;
+                        cur_h = fh;
+                        encoder = Some(e);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "encoder: reinit failed");
+                        continue;
+                    }
+                }
             }
-            match encoder.encode(&frame.bgra, frame.pts_ms) {
+
+            let Some(enc) = encoder.as_mut() else {
+                continue;
+            };
+
+            match enc.encode(&frame.bgra, frame.pts_ms) {
                 Ok(pkt) if pkt.is_empty() => {}
                 Ok(pkt) => {
                     let duration_ms = frame.pts_ms.saturating_sub(last_pts).max(1);
@@ -295,27 +364,31 @@ fn spawn_encoder_task(
             }
         }
         // Drain any libvpx-buffered frames on clean shutdown.
-        if let Ok(tail) = encoder.finish() {
-            if !tail.is_empty() {
-                let _ = enc_tx.blocking_send((tail, 1));
+        if let Some(enc) = encoder.take() {
+            if let Ok(tail) = enc.finish() {
+                if !tail.is_empty() {
+                    let _ = enc_tx.blocking_send((tail, 1));
+                }
             }
         }
     });
 
-    tokio::spawn(async move {
+    let forwarder = tokio::spawn(async move {
         while let Some((pkt, duration_ms)) = enc_rx.recv().await {
             if let Err(e) = webrtc.push_frame(&pkt, duration_ms).await {
                 tracing::warn!(error = %e, "webrtc: push_frame failed");
             }
         }
-    })
+    });
+
+    (blocking, forwarder)
 }
 
 fn spawn_signaling_loop(
     mut events: mpsc::Receiver<ServerMessage>,
     client_tx: mpsc::Sender<ClientMessage>,
     webrtc: Arc<WebRtcHost>,
-    shutdown_tx: mpsc::Sender<()>,
+    shutdown_tx: mpsc::Sender<&'static str>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(msg) = events.recv().await {
@@ -337,7 +410,7 @@ fn spawn_signaling_loop(
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "webrtc: create_offer failed");
-                            let _ = shutdown_tx.try_send(());
+                            let _ = shutdown_tx.try_send("create_offer_failed");
                             break;
                         }
                     }
@@ -345,7 +418,7 @@ fn spawn_signaling_loop(
                 ServerMessage::Answer { sdp } => {
                     if let Err(e) = webrtc.set_answer(sdp.sdp).await {
                         tracing::error!(error = %e, "webrtc: set_answer failed");
-                        let _ = shutdown_tx.try_send(());
+                        let _ = shutdown_tx.try_send("set_answer_failed");
                         break;
                     }
                 }
@@ -376,7 +449,7 @@ fn spawn_signaling_loop(
                 }
                 ServerMessage::PeerDisconnected | ServerMessage::SessionExpired => {
                     tracing::info!("signaling: session ended by server/peer");
-                    let _ = shutdown_tx.try_send(());
+                    let _ = shutdown_tx.try_send("peer_disconnected");
                     break;
                 }
                 ServerMessage::Error { error } => {
@@ -384,7 +457,7 @@ fn spawn_signaling_loop(
                     // Hard errors (rate_limited, server_shutdown) mean the
                     // socket is unusable — exit the loop.
                     if error == "server_shutdown" || error == "rate_limited" {
-                        let _ = shutdown_tx.try_send(());
+                        let _ = shutdown_tx.try_send("server_error");
                         break;
                     }
                 }
@@ -424,14 +497,18 @@ fn spawn_ice_forwarder(
 
 fn spawn_state_watcher(
     mut state_rx: mpsc::Receiver<ConnState>,
-    shutdown_tx: mpsc::Sender<()>,
+    shutdown_tx: mpsc::Sender<&'static str>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(s) = state_rx.recv().await {
             tracing::info!(state = ?s, "webrtc: connection state");
             match s {
-                ConnState::Failed | ConnState::Closed => {
-                    let _ = shutdown_tx.try_send(());
+                ConnState::Failed => {
+                    let _ = shutdown_tx.try_send("ice_failed");
+                    break;
+                }
+                ConnState::Closed => {
+                    let _ = shutdown_tx.try_send("ice_closed");
                     break;
                 }
                 _ => {}
@@ -451,7 +528,7 @@ async fn abort_after(task: JoinHandle<()>, timeout: Duration) {
 fn even(v: u32, fallback: u32) -> u32 {
     if v == 0 {
         fallback
-    } else if v % 2 == 0 {
+    } else if v.is_multiple_of(2) {
         v
     } else {
         v - 1

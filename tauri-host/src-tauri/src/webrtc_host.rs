@@ -32,6 +32,7 @@ use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
@@ -96,14 +97,40 @@ impl WebRtcHost {
     /// channels that relay local ICE candidates and connection-state changes.
     pub async fn new(ice_servers: Vec<RTCIceServer>) -> Result<Self, WebRtcError> {
         let mut media = MediaEngine::default();
+
+        // Mirror webrtc-rs's default video RTCP feedback set. Required for
+        // reasonable behavior in Chrome / the in-repo viewer: REMB for
+        // bandwidth estimation, NACK/PLI for loss recovery, CCM FIR for
+        // forced intra refresh.
+        let video_rtcp_feedback = vec![
+            RTCPFeedback {
+                typ: "goog-remb".to_owned(),
+                parameter: String::new(),
+            },
+            RTCPFeedback {
+                typ: "ccm".to_owned(),
+                parameter: "fir".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: String::new(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "pli".to_owned(),
+            },
+        ];
+
         media.register_codec(
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_VP9.to_owned(),
                     clock_rate: 90_000,
                     channels: 0,
-                    sdp_fmtp_line: String::new(),
-                    rtcp_feedback: vec![],
+                    // `profile-id=0` matches our 8-bit 4:2:0 VP9 encoder
+                    // output and matches webrtc-rs's default VP9 PT 98 entry.
+                    sdp_fmtp_line: "profile-id=0".to_owned(),
+                    rtcp_feedback: video_rtcp_feedback,
                 },
                 payload_type: 98,
                 ..Default::default()

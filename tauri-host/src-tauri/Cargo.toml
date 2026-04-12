@@ -39,8 +39,10 @@ bytes = "1"
 vpx-encode = { version = "0.6", features = ["vp9"] }
 
 # Real screen capture — Windows only for Phase 1 (macOS/Linux planned).
+# Pinned to 1.5.x: `FrameBuffer::as_nopadding_buffer` and the 8-arg
+# `Settings::new` shape are stable there; later minor versions may reshape them.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-capture = "1"
+windows-capture = "~1.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }

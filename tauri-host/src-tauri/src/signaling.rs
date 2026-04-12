@@ -20,6 +20,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -125,6 +126,12 @@ pub enum ServerMessage {
     Error { error: String },
 }
 
+/// Slot the inbound pump uses to deliver the `session-created` (or server
+/// error while waiting for it) to a pending `create_session()` call. The slot
+/// is armed *only* inside `create_session()` so that unsolicited pre-
+/// create-session errors never consume a oneshot that no one is waiting on.
+type CreatedSlot = Arc<StdMutex<Option<oneshot::Sender<Result<String, SignalingError>>>>>;
+
 /// Handle to a live signaling connection.
 ///
 /// Call [`SignalingClient::close`] to cleanly tear down the socket; otherwise
@@ -134,7 +141,7 @@ pub struct SignalingClient {
     /// `None` after `close()` has been called.
     tx: Option<mpsc::Sender<ClientMessage>>,
     events: Option<mpsc::Receiver<ServerMessage>>,
-    session_created_rx: Option<oneshot::Receiver<Result<String, SignalingError>>>,
+    created_slot: CreatedSlot,
 }
 
 impl SignalingClient {
@@ -163,17 +170,37 @@ impl SignalingClient {
     }
 
     /// Request a new session and wait for the server's `session-created`
-    /// response (or the first error). Returns the PIN on success.
+    /// response (or the first error while waiting). Returns the PIN on success.
+    ///
+    /// The `session-created` slot is armed *here* — not at connect time — so
+    /// an unsolicited server error before `create_session()` is called cannot
+    /// consume the oneshot that a later `create_session()` would block on.
     pub async fn create_session(&mut self) -> Result<String, SignalingError> {
-        self.send(ClientMessage::CreateSession).await?;
-        let rx = self
-            .session_created_rx
-            .take()
-            .ok_or_else(|| SignalingError::Protocol("session already created".into()))?;
+        let (tx, rx) = oneshot::channel::<Result<String, SignalingError>>();
+        {
+            let mut slot = self.created_slot.lock().unwrap();
+            if slot.is_some() {
+                return Err(SignalingError::Protocol(
+                    "create_session already in flight".into(),
+                ));
+            }
+            *slot = Some(tx);
+        }
+
+        if let Err(e) = self.send(ClientMessage::CreateSession).await {
+            // Disarm the slot on send failure.
+            let _ = self.created_slot.lock().unwrap().take();
+            return Err(e);
+        }
+
         match tokio::time::timeout(Duration::from_secs(10), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(SignalingError::ChannelClosed),
-            Err(_) => Err(SignalingError::Timeout("session-created")),
+            Err(_) => {
+                // Disarm on timeout so a late response doesn't stall a later call.
+                let _ = self.created_slot.lock().unwrap().take();
+                Err(SignalingError::Timeout("session-created"))
+            }
         }
     }
 
@@ -191,8 +218,8 @@ pub async fn connect(url: &str) -> Result<SignalingClient, SignalingError> {
 
     let (client_tx, mut client_rx) = mpsc::channel::<ClientMessage>(32);
     let (event_tx, event_rx) = mpsc::channel::<ServerMessage>(32);
-    let (created_tx, created_rx) = oneshot::channel::<Result<String, SignalingError>>();
-    let mut created_tx = Some(created_tx);
+    let created_slot: CreatedSlot = Arc::new(StdMutex::new(None));
+    let pump_slot = Arc::clone(&created_slot);
 
     // Outbound pump: serialize ClientMessage -> WsMessage::Text. Exits when the
     // last Sender (held by SignalingClient) is dropped.
@@ -223,21 +250,28 @@ pub async fn connect(url: &str) -> Result<SignalingClient, SignalingError> {
                     let parsed: Result<ServerMessage, _> = serde_json::from_str(&txt);
                     match parsed {
                         Ok(sm) => {
-                            if let Some(tx) = created_tx.take() {
-                                match &sm {
-                                    ServerMessage::SessionCreated { pin } => {
+                            // Only fulfil the slot if it's armed (i.e. a
+                            // create_session() call is in flight). Unsolicited
+                            // errors delivered before create_session() is
+                            // called go to the events channel only.
+                            match &sm {
+                                ServerMessage::SessionCreated { pin } => {
+                                    if let Some(tx) =
+                                        pump_slot.lock().unwrap().take()
+                                    {
                                         let _ = tx.send(Ok(pin.clone()));
                                     }
-                                    ServerMessage::Error { error } => {
+                                }
+                                ServerMessage::Error { error } => {
+                                    if let Some(tx) =
+                                        pump_slot.lock().unwrap().take()
+                                    {
                                         let _ = tx.send(Err(SignalingError::Server(
                                             error.clone(),
                                         )));
                                     }
-                                    _ => {
-                                        // Not what we were waiting for yet; put it back.
-                                        created_tx = Some(tx);
-                                    }
                                 }
+                                _ => {}
                             }
                             if inbound_event_tx.send(sm).await.is_err() {
                                 break;
@@ -270,7 +304,7 @@ pub async fn connect(url: &str) -> Result<SignalingClient, SignalingError> {
         url: url.to_string(),
         tx: Some(client_tx),
         events: Some(event_rx),
-        session_created_rx: Some(created_rx),
+        created_slot,
     })
 }
 
