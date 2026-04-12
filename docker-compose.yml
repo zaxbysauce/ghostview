@@ -1,0 +1,48 @@
+# GhostView — signaling server + coturn STUN/TURN server
+#
+# Usage:
+#   1. Place TLS certs in ./certs/cert.pem and ./certs/key.pem
+#      For production use real certs (e.g. Let's Encrypt).
+#      For dev: openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem \
+#        -out certs/cert.pem -days 365 -nodes -subj '/CN=localhost'
+#   2. Edit turnserver.conf: set `realm`, `user`, and external-ip before exposing.
+#   3. `docker compose up -d`
+#
+# coturn uses network_mode: host because WebRTC TURN needs a large UDP port
+# range and publishing all of it via Docker's NAT is impractical.
+
+services:
+  coturn:
+    image: coturn/coturn:latest
+    container_name: ghostview-coturn
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    restart: unless-stopped
+    # Health check — coturn's TCP 3478 should be reachable locally.
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 3478 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ghostview-signaling:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ghostview-signaling
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./certs:/app/certs:ro
+    environment:
+      PORT: "8443"
+      HOST: "0.0.0.0"
+      # Comma-separated list of allowed Origin headers; empty = permissive (dev).
+      # ALLOWED_ORIGINS: "https://example.com,https://app.example.com"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1:8443/health >/dev/null 2>&1 || wget -qO- http://127.0.0.1:8443/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

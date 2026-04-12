@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>GhostView Lite — Browser Host</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <header class="nav" role="banner">
+      <a href="/" class="brand" aria-label="GhostView home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        GhostView
+        <span class="brand-tag">Lite — Browser Host</span>
+      </a>
+      <a href="/" class="btn btn-ghost">View a session</a>
+    </header>
+
+    <main class="main">
+      <section
+        class="card"
+        id="start-card"
+        aria-labelledby="start-heading"
+      >
+        <h1 id="start-heading">Share your screen</h1>
+        <p class="lede">
+          Start a session and share the 6-digit PIN with your viewer. The PIN
+          is valid for 10 minutes and can only be used once.
+        </p>
+        <button
+          type="button"
+          id="start-btn"
+          class="btn btn-primary btn-block"
+        >
+          Start sharing
+        </button>
+        <div
+          id="start-error"
+          class="alert alert-error"
+          role="alert"
+          aria-live="polite"
+          hidden
+        ></div>
+        <p class="footer-note">
+          You will be asked to choose a screen, window, or tab. GhostView never
+          sees your screen — video goes peer-to-peer.
+        </p>
+      </section>
+
+      <section
+        class="card"
+        id="session-card"
+        aria-labelledby="session-heading"
+        hidden
+      >
+        <div
+          style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;"
+        >
+          <h1 id="session-heading" style="margin:0">Session active</h1>
+          <div class="status" id="host-status" data-state="idle" role="status" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="status-label">Idle</span>
+          </div>
+        </div>
+        <p class="lede">
+          Share this PIN with your viewer. They should enter it at
+          <strong id="origin-hint">this site</strong>.
+        </p>
+
+        <div
+          id="pin-display"
+          class="pin-display"
+          aria-label="Session PIN"
+          aria-live="polite"
+        >
+          ——————
+        </div>
+
+        <div class="pin-meta">
+          <span>
+            Expires in
+            <span class="timer" id="timer" aria-live="off">10:00</span>
+          </span>
+          <button type="button" id="copy-btn" class="btn">Copy PIN</button>
+        </div>
+
+        <div class="form-row">
+          <button type="button" id="stop-btn" class="btn btn-danger btn-block">
+            Stop sharing
+          </button>
+        </div>
+
+        <div
+          id="session-error"
+          class="alert alert-error"
+          role="alert"
+          aria-live="polite"
+          hidden
+        ></div>
+      </section>
+    </main>
+
+    <script src="/assets/ghostview-host-lite.js"></script>
+    <script>
+      (function () {
+        'use strict';
+
+        const startCard = document.getElementById('start-card');
+        const sessionCard = document.getElementById('session-card');
+        const startBtn = document.getElementById('start-btn');
+        const startError = document.getElementById('start-error');
+        const sessionError = document.getElementById('session-error');
+        const pinDisplay = document.getElementById('pin-display');
+        const copyBtn = document.getElementById('copy-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const timerEl = document.getElementById('timer');
+        const statusEl = document.getElementById('host-status');
+        const statusLabel = statusEl.querySelector('.status-label');
+        const originHint = document.getElementById('origin-hint');
+
+        originHint.textContent = window.location.host;
+
+        const ERROR_MESSAGES = {
+          capture_denied:
+            'Screen capture was cancelled or denied. Try again and pick a screen, window, or tab.',
+          signaling_failed:
+            'Could not reach the GhostView signaling server. Check your connection and try again.',
+          peer_disconnected: 'The viewer disconnected.',
+          pin_expired: 'This PIN expired before a viewer connected.',
+          connection_failed: 'The peer connection failed.',
+          negotiation_failed: 'Could not negotiate the video stream.',
+          rate_limited: 'Too many attempts. Please wait a minute and try again.',
+          server_error: 'The server could not create a session right now.',
+          failed: 'Something went wrong. Please try again.',
+        };
+
+        const STATUS_LABELS = {
+          idle: 'Idle',
+          connecting: 'Connecting',
+          waiting: 'Waiting for viewer',
+          streaming: 'Streaming',
+          disconnected: 'Disconnected',
+          error: 'Error',
+        };
+
+        function wsUrl() {
+          const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          return `${proto}//${window.location.host}/`;
+        }
+
+        function setStatus(state) {
+          statusEl.dataset.state = state;
+          statusLabel.textContent = STATUS_LABELS[state] || state;
+        }
+
+        function showStartError(code) {
+          startError.textContent = ERROR_MESSAGES[code] || 'Something went wrong.';
+          startError.hidden = false;
+        }
+
+        function showSessionError(code) {
+          sessionError.textContent = ERROR_MESSAGES[code] || 'Something went wrong.';
+          sessionError.hidden = false;
+        }
+
+        function clearErrors() {
+          startError.hidden = true;
+          startError.textContent = '';
+          sessionError.hidden = true;
+          sessionError.textContent = '';
+        }
+
+        function formatPin(pin) {
+          return pin.replace(/(\d{3})(\d{3})/, '$1 $2');
+        }
+
+        let host = null;
+        let timerInterval = null;
+        let expiresAt = 0;
+
+        function startTimer() {
+          expiresAt = Date.now() + 10 * 60 * 1000;
+          renderTimer();
+          if (timerInterval) clearInterval(timerInterval);
+          timerInterval = setInterval(renderTimer, 1000);
+        }
+
+        function renderTimer() {
+          const remaining = Math.max(0, expiresAt - Date.now());
+          const m = Math.floor(remaining / 60000);
+          const s = Math.floor((remaining % 60000) / 1000);
+          timerEl.textContent =
+            `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+          if (remaining <= 0 && timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+          }
+        }
+
+        function stopTimer() {
+          if (timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+          }
+          timerEl.textContent = '00:00';
+        }
+
+        function showSession() {
+          startCard.hidden = true;
+          sessionCard.hidden = false;
+        }
+
+        function showStart() {
+          sessionCard.hidden = true;
+          startCard.hidden = false;
+          pinDisplay.textContent = '——————';
+          stopTimer();
+          startBtn.disabled = false;
+          startBtn.textContent = 'Start sharing';
+        }
+
+        startBtn.addEventListener('click', () => {
+          clearErrors();
+          startBtn.disabled = true;
+          startBtn.textContent = 'Requesting screen…';
+
+          host = new window.GhostViewHostLite({
+            signalingUrl: wsUrl(),
+            onStatus: (s) => setStatus(s),
+            onPin: (pin) => {
+              pinDisplay.textContent = formatPin(pin);
+              showSession();
+              startTimer();
+            },
+            onViewerJoined: () => {
+              clearErrors();
+            },
+            onError: (code) => {
+              if (!sessionCard.hidden) {
+                showSessionError(code);
+                if (['peer_disconnected', 'pin_expired', 'connection_failed'].includes(code)) {
+                  setStatus('disconnected');
+                }
+              } else {
+                showStartError(code);
+                startBtn.disabled = false;
+                startBtn.textContent = 'Start sharing';
+              }
+            },
+            onEnded: () => {
+              // User stopped sharing via browser UI
+              showStart();
+              setStatus('idle');
+            },
+          });
+
+          host.start();
+        });
+
+        stopBtn.addEventListener('click', () => {
+          if (host) host.stop();
+          showStart();
+          setStatus('idle');
+        });
+
+        copyBtn.addEventListener('click', async () => {
+          const raw = pinDisplay.textContent.replace(/\D+/g, '');
+          if (!raw || raw.length !== 6) return;
+          try {
+            await navigator.clipboard.writeText(raw);
+            const prev = copyBtn.textContent;
+            copyBtn.textContent = 'Copied';
+            setTimeout(() => {
+              copyBtn.textContent = prev;
+            }, 1500);
+          } catch {
+            copyBtn.textContent = 'Copy failed';
+            setTimeout(() => {
+              copyBtn.textContent = 'Copy PIN';
+            }, 1500);
+          }
+        });
+
+        window.addEventListener('beforeunload', () => {
+          if (host) {
+            try { host.stop(); } catch { /* ignore */ }
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

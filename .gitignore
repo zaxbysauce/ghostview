@@ -1,0 +1,43 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Rust / Cargo
+target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Tauri generated
+tauri-host/src-tauri/gen/
+tauri-host/dist/
+
+# TLS / secrets — never commit
+certs/
+*.pem
+*.key
+*.crt
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build output
+dist/
+build/
+*.log
+
+# Claude Code session state (ephemeral, per-session)
+.claude/session/

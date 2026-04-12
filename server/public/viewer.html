@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>GhostView — Viewer</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <header class="nav" role="banner">
+      <a href="/" class="brand" aria-label="GhostView home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        GhostView
+        <span class="brand-tag">Viewer</span>
+      </a>
+      <a href="/host-lite" class="btn btn-ghost">Share my screen</a>
+    </header>
+
+    <main class="main" id="entry-view">
+      <section class="card" aria-labelledby="connect-heading">
+        <h1 id="connect-heading">Enter session PIN</h1>
+        <p class="lede">
+          Ask the person sharing their screen for the 6-digit PIN and enter it
+          below to view their session.
+        </p>
+
+        <form id="pin-form" novalidate>
+          <label for="pin-input">6-digit PIN</label>
+          <input
+            id="pin-input"
+            class="input-pin"
+            type="text"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            pattern="\d{6}"
+            maxlength="6"
+            minlength="6"
+            required
+            aria-describedby="pin-help pin-error"
+            placeholder="000000"
+            spellcheck="false"
+            autocorrect="off"
+            autocapitalize="off"
+          />
+          <p id="pin-help" class="sr-only">
+            Enter the 6-digit PIN shared by the host.
+          </p>
+
+          <div class="form-row">
+            <button type="submit" id="connect-btn" class="btn btn-primary btn-block">
+              Connect
+            </button>
+          </div>
+
+          <div
+            id="pin-error"
+            class="alert alert-error"
+            role="alert"
+            aria-live="polite"
+            hidden
+          ></div>
+        </form>
+
+        <p class="footer-note">
+          Your connection is peer-to-peer. The server only relays the PIN
+          handshake.
+        </p>
+      </section>
+    </main>
+
+    <section
+      class="viewer-stage"
+      id="viewer-stage"
+      hidden
+      aria-label="Remote screen viewer"
+    >
+      <video
+        id="remote-video"
+        autoplay
+        playsinline
+        muted
+        aria-label="Remote screen"
+      ></video>
+
+      <div class="viewer-overlay" role="status" aria-live="polite">
+        <div class="status" id="viewer-status" data-state="idle">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span class="status-label">Idle</span>
+        </div>
+      </div>
+
+      <div class="viewer-controls" role="toolbar" aria-label="Viewer controls">
+        <button type="button" id="fullscreen-btn" class="btn">
+          Fullscreen
+        </button>
+        <button type="button" id="end-btn" class="btn btn-danger">
+          End session
+        </button>
+      </div>
+    </section>
+
+    <script src="/assets/ghostview-viewer.js"></script>
+    <script>
+      (function () {
+        'use strict';
+
+        const entryView = document.getElementById('entry-view');
+        const stage = document.getElementById('viewer-stage');
+        const form = document.getElementById('pin-form');
+        const pinInput = document.getElementById('pin-input');
+        const errorBox = document.getElementById('pin-error');
+        const connectBtn = document.getElementById('connect-btn');
+        const video = document.getElementById('remote-video');
+        const statusEl = document.getElementById('viewer-status');
+        const statusLabel = statusEl.querySelector('.status-label');
+        const endBtn = document.getElementById('end-btn');
+        const fsBtn = document.getElementById('fullscreen-btn');
+
+        const ERROR_MESSAGES = {
+          invalid_pin: 'That PIN is not valid. Double-check and try again.',
+          pin_expired: 'This PIN has expired. Ask the host for a new one.',
+          session_in_use: 'This session already has a viewer connected.',
+          rate_limited: 'Too many attempts. Please wait a minute and try again.',
+          failed: 'Could not connect to the server. Please try again.',
+          peer_disconnected: 'The host ended the session.',
+          connection_failed: 'The peer connection failed.',
+          negotiation_failed: 'Could not negotiate the video stream.',
+        };
+
+        const STATUS_LABELS = {
+          idle: 'Idle',
+          connecting: 'Connecting',
+          waiting: 'Waiting for host',
+          streaming: 'Streaming',
+          disconnected: 'Disconnected',
+          error: 'Error',
+        };
+
+        function wsUrl() {
+          const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          return `${proto}//${window.location.host}/`;
+        }
+
+        function showError(code) {
+          const msg = ERROR_MESSAGES[code] || 'Something went wrong.';
+          errorBox.textContent = msg;
+          errorBox.hidden = false;
+        }
+
+        function clearError() {
+          errorBox.hidden = true;
+          errorBox.textContent = '';
+        }
+
+        function setStatus(state) {
+          statusEl.dataset.state = state;
+          statusLabel.textContent = STATUS_LABELS[state] || state;
+        }
+
+        let viewer = null;
+
+        function goToStage() {
+          entryView.hidden = true;
+          stage.hidden = false;
+        }
+
+        function goToEntry() {
+          stage.hidden = true;
+          entryView.hidden = false;
+          pinInput.value = '';
+          pinInput.focus();
+        }
+
+        pinInput.addEventListener('input', () => {
+          const cleaned = pinInput.value.replace(/\D+/g, '').slice(0, 6);
+          if (cleaned !== pinInput.value) pinInput.value = cleaned;
+          clearError();
+        });
+
+        form.addEventListener('submit', (ev) => {
+          ev.preventDefault();
+          clearError();
+          const pin = pinInput.value.trim();
+          if (!/^\d{6}$/.test(pin)) {
+            showError('invalid_pin');
+            pinInput.focus();
+            return;
+          }
+          connectBtn.disabled = true;
+          connectBtn.textContent = 'Connecting…';
+
+          viewer = new window.GhostViewViewer({
+            signalingUrl: wsUrl(),
+            videoElement: video,
+            onStatus: (s) => setStatus(s),
+            onError: (code) => {
+              showError(code);
+              if (['invalid_pin', 'pin_expired', 'session_in_use', 'rate_limited', 'failed'].includes(code)) {
+                connectBtn.disabled = false;
+                connectBtn.textContent = 'Connect';
+                stage.hidden = true;
+                entryView.hidden = false;
+              }
+            },
+            onStream: () => {
+              goToStage();
+            },
+            onClose: () => {
+              connectBtn.disabled = false;
+              connectBtn.textContent = 'Connect';
+              if (!stage.hidden) {
+                goToEntry();
+              }
+            },
+          });
+
+          viewer.connect(pin);
+        });
+
+        endBtn.addEventListener('click', () => {
+          if (viewer) viewer.close();
+          setStatus('idle');
+          goToEntry();
+          connectBtn.disabled = false;
+          connectBtn.textContent = 'Connect';
+        });
+
+        fsBtn.addEventListener('click', async () => {
+          try {
+            if (document.fullscreenElement) {
+              await document.exitFullscreen();
+            } else {
+              await stage.requestFullscreen();
+            }
+          } catch {
+            /* ignore fullscreen errors */
+          }
+        });
+
+        document.addEventListener('fullscreenchange', () => {
+          fsBtn.textContent = document.fullscreenElement
+            ? 'Exit fullscreen'
+            : 'Fullscreen';
+        });
+
+        window.addEventListener('beforeunload', () => {
+          if (viewer) {
+            try { viewer.close(); } catch { /* ignore */ }
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
