@@ -63,19 +63,45 @@ Open two browser tabs:
 
 Your browser will warn about the self-signed cert; accept it in both tabs.
 
-### 2. STUN/TURN (optional, for connections across NAT)
+### 2. TURN Server (coturn) Setup
+
+GhostView uses coturn for STUN/TURN relay (required for NAT traversal).
+
+#### Development (Self-Signed)
 
 ```bash
-# Copy the template, fill in credentials, then start the container.
 cp turnserver.conf.example turnserver.conf
-# Edit turnserver.conf:
-#   realm=<your.domain>
-#   user=<username>:<strong-random-password>
-#   external-ip=<public-ip>     # uncomment if behind NAT
+# Edit turnserver.conf: set realm, username, password
 docker compose up -d coturn
 ```
 
-`turnserver.conf` is gitignored so credentials never reach the repo.
+#### Production (Environment-Injected Secrets)
+
+Do NOT commit `turnserver.conf` with real credentials. Instead:
+
+1. Create secrets via environment variables:
+   ```bash
+   export TURN_REALM=your-domain.com
+   export TURN_USER=bot-user
+   export TURN_PASSWORD=$(openssl rand -base64 32)
+   export TURN_SECRET=$(openssl rand -base64 32)
+   ```
+
+2. Inject at container startup via entrypoint script:
+   ```bash
+   # docker-compose.yml coturn service:
+   environment:
+     TURN_REALM: ${TURN_REALM}
+     TURN_USER: ${TURN_USER}
+     TURN_PASSWORD: ${TURN_PASSWORD}
+   # Entrypoint script generates turnserver.conf from template
+   ```
+
+3. Use short-term credentials for production:
+   - Enable `use-auth-secret` mode in coturn
+   - Signaling server rotates HMAC-SHA1 credentials every 10 minutes (Phase 2)
+
+**Important:** `turnserver.conf` is gitignored so credentials never reach the repo. Verify with `git grep -n "supersecretpassword"` that no test credentials accidentally leak.
 
 #### TURNS (TLS-wrapped TURN) for corporate firewalls
 

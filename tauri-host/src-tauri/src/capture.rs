@@ -119,11 +119,12 @@ mod windows_impl {
     //! # COM Apartment
     //!
     //! The Windows Graphics Capture API and `windows-capture` internally
-    //! initialize a COM Single-Threaded Apartment (STA). Our `std::thread::spawn`
+    //! initialize a COM state (STA or MTA). Our `std::thread::spawn`
     //! is the correct host for this initialization: the dedicated OS thread
-    //! isolates COM STA state and prevents conflicts with Tokio's multi-threaded
+    //! isolates Windows COM state (STA or MTA) and prevents conflicts with Tokio's multi-threaded
     //! runtime (which may not have COM initialized). The capture thread will
     //! initialize and tear down COM as needed on entry/exit.
+    //! Note: windows-capture initializes MTA (Multi-Threaded Apartment) internally.
 
     use super::{CaptureError, RawFrame};
     use crate::MonitorInfo;
@@ -172,7 +173,8 @@ mod windows_impl {
             frame: &mut Frame<'_>,
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
-            if self.stopping.load(Ordering::Relaxed) {
+            // Acquire: ensure stop signal is visible before frame capture continues
+            if self.stopping.load(Ordering::Acquire) {
                 capture_control.stop();
                 return Ok(());
             }
@@ -222,7 +224,8 @@ mod windows_impl {
 
     impl Handle {
         pub async fn stop(mut self) {
-            self.stopping.store(true, Ordering::Relaxed);
+            // Release: flush stop signal to all threads immediately
+            self.stopping.store(true, Ordering::Release);
             if let Some(t) = self.thread.take() {
                 // Join on a blocking thread so we don't stall the tokio runtime.
                 let _ = tokio::task::spawn_blocking(move || {
@@ -233,7 +236,8 @@ mod windows_impl {
         }
 
         pub fn abort(mut self) {
-            self.stopping.store(true, Ordering::Relaxed);
+            // Release: flush stop signal immediately for abrupt termination
+            self.stopping.store(true, Ordering::Release);
             // Let the capture thread notice the flag on its next frame and exit.
             drop(self.thread.take());
         }
@@ -272,9 +276,9 @@ mod windows_impl {
     ) -> Result<Handle, CaptureError> {
         let monitors = Monitor::enumerate()
             .map_err(|e| CaptureError::Failed(format!("monitor enumerate: {e:?}")))?;
+        // Bounds check via .get() + .ok_or() is safe; handles monitor disconnect gracefully
         let monitor = monitors
-            .into_iter()
-            .nth(monitor_index)
+            .get(monitor_index)
             .ok_or(CaptureError::MonitorNotFound(monitor_index))?;
 
         let stopping = Arc::new(AtomicBool::new(false));
@@ -334,6 +338,28 @@ mod tests {
         // contract is verified by windows-capture crate tests.
         #[cfg(target_os = "windows")]
         assert!(!monitors.is_empty(), "Windows test must have at least one monitor");
+    }
+
+    #[test]
+    fn monitor_index_out_of_bounds_returns_error() {
+        // Verify that requesting a monitor index beyond the list size returns
+        // MonitorNotFound, not a panic. This tests the bounds check safety.
+        let (tx, _rx) = mpsc::channel(1);
+
+        // Request monitor index 999 (will be out of bounds on any system)
+        let result = start(999, tx);
+
+        match result {
+            Err(CaptureError::MonitorNotFound(index)) => {
+                assert_eq!(index, 999, "Error should contain the requested index");
+            }
+            Ok(_) => {
+                panic!("start() should have failed with MonitorNotFound, but succeeded");
+            }
+            Err(e) => {
+                panic!("start() returned unexpected error: {e:?}");
+            }
+        }
     }
 }
 
