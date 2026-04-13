@@ -65,11 +65,7 @@ pub struct SdpPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IceCandidateInit {
     pub candidate: String,
-    #[serde(
-        rename = "sdpMid",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "sdpMid", default, skip_serializing_if = "Option::is_none")]
     pub sdp_mid: Option<String>,
     #[serde(
         rename = "sdpMLineIndex",
@@ -95,9 +91,15 @@ pub enum ClientMessage {
     CreateSession,
     /// Join an existing session by PIN (viewer direction; unused by the Pro host
     /// but included for completeness / future multi-viewer support).
-    JoinSession { pin: String },
-    Offer { sdp: SdpPayload },
-    Answer { sdp: SdpPayload },
+    JoinSession {
+        pin: String,
+    },
+    Offer {
+        sdp: SdpPayload,
+    },
+    Answer {
+        sdp: SdpPayload,
+    },
     /// `candidate: null` is a valid end-of-candidates sentinel.
     IceCandidate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,11 +112,17 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ServerMessage {
-    SessionCreated { pin: String },
+    SessionCreated {
+        pin: String,
+    },
     SessionJoined,
     ViewerJoined,
-    Offer { sdp: SdpPayload },
-    Answer { sdp: SdpPayload },
+    Offer {
+        sdp: SdpPayload,
+    },
+    Answer {
+        sdp: SdpPayload,
+    },
     IceCandidate {
         #[serde(default)]
         candidate: Option<IceCandidateInit>,
@@ -122,7 +130,9 @@ pub enum ServerMessage {
     PeerDisconnected,
     SessionExpired,
     /// The server uses `error` (not `message`) as the string field name.
-    Error { error: String },
+    Error {
+        error: String,
+    },
 }
 
 /// Slot the inbound pump uses to deliver the `session-created` (or server
@@ -271,19 +281,13 @@ pub async fn connect(url: &str) -> Result<SignalingClient, SignalingError> {
                             // called go to the events channel only.
                             match &sm {
                                 ServerMessage::SessionCreated { pin } => {
-                                    if let Some(tx) =
-                                        pump_slot.lock().unwrap().take()
-                                    {
+                                    if let Some(tx) = pump_slot.lock().unwrap().take() {
                                         let _ = tx.send(Ok(pin.clone()));
                                     }
                                 }
                                 ServerMessage::Error { error } => {
-                                    if let Some(tx) =
-                                        pump_slot.lock().unwrap().take()
-                                    {
-                                        let _ = tx.send(Err(SignalingError::Server(
-                                            error.clone(),
-                                        )));
+                                    if let Some(tx) = pump_slot.lock().unwrap().take() {
+                                        let _ = tx.send(Err(SignalingError::Server(error.clone())));
                                     }
                                 }
                                 _ => {}
@@ -424,10 +428,9 @@ mod tests {
 
     #[test]
     fn parses_answer_with_nested_sdp() {
-        let sm: ServerMessage = serde_json::from_str(
-            r#"{"type":"answer","sdp":{"type":"answer","sdp":"v=0\r\n"}}"#,
-        )
-        .unwrap();
+        let sm: ServerMessage =
+            serde_json::from_str(r#"{"type":"answer","sdp":{"type":"answer","sdp":"v=0\r\n"}}"#)
+                .unwrap();
         match sm {
             ServerMessage::Answer { sdp } => {
                 assert_eq!(sdp.kind, "answer");
@@ -458,6 +461,9 @@ mod tests {
     fn parses_ice_candidate_null() {
         let sm: ServerMessage =
             serde_json::from_str(r#"{"type":"ice-candidate","candidate":null}"#).unwrap();
-        assert!(matches!(sm, ServerMessage::IceCandidate { candidate: None }));
+        assert!(matches!(
+            sm,
+            ServerMessage::IceCandidate { candidate: None }
+        ));
     }
 }

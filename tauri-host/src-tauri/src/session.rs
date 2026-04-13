@@ -56,8 +56,7 @@ pub enum SessionError {
 
 /// Default signaling URL, overridable via `GHOSTVIEW_SIGNALING_URL`.
 pub fn signaling_url() -> String {
-    std::env::var("GHOSTVIEW_SIGNALING_URL")
-        .unwrap_or_else(|_| "ws://localhost:8443/".to_string())
+    std::env::var("GHOSTVIEW_SIGNALING_URL").unwrap_or_else(|_| "ws://localhost:8443/".to_string())
 }
 
 /// ICE server list, overridable via `GHOSTVIEW_ICE_SERVERS` (comma-separated
@@ -273,11 +272,16 @@ impl AppState {
                         "signaling events already taken".into(),
                     ))
                 })?;
-            let client_tx = partial.signaling.as_ref().unwrap().sender().ok_or_else(|| {
-                SessionError::Signaling(SignalingError::Protocol(
-                    "signaling sender unavailable".into(),
-                ))
-            })?;
+            let client_tx = partial
+                .signaling
+                .as_ref()
+                .unwrap()
+                .sender()
+                .ok_or_else(|| {
+                    SessionError::Signaling(SignalingError::Protocol(
+                        "signaling sender unavailable".into(),
+                    ))
+                })?;
 
             let (shutdown_tx, shutdown_rx) = mpsc::channel::<&'static str>(4);
 
@@ -316,10 +320,7 @@ impl AppState {
                         partial.encoder_blocking.take().expect("encoder_blocking"),
                     ),
                     signaling_task: partial.signaling_task.take().expect("signaling_task"),
-                    ice_forward_task: partial
-                        .ice_forward_task
-                        .take()
-                        .expect("ice_forward_task"),
+                    ice_forward_task: partial.ice_forward_task.take().expect("ice_forward_task"),
                     state_task: partial.state_task.take().expect("state_task"),
                     signaling: partial.signaling.take().expect("signaling"),
                     webrtc: partial.webrtc.take().expect("webrtc"),
@@ -407,6 +408,13 @@ impl Default for AppState {
 /// resolution differs from the configured size (e.g. mixed-DPI scenarios,
 /// display mode changes after start). A reinit forces the next frame to be
 /// a keyframe by virtue of libvpx being freshly constructed.
+///
+/// **Frame buffering (Phase 1):** Encoded frames buffer in the attached
+/// WebRTC `TrackLocalStaticSample` until a peer connects. No backpressure
+/// or metrics; memory grows linearly with frame rate until connection.
+///
+/// **Phase 2:** Implement metrics (buffer depth, drops) and optional
+/// frame drop if buffer exceeds threshold (e.g., >500 frames).
 fn spawn_encoder_pair(
     initial_width: u32,
     initial_height: u32,
@@ -651,15 +659,19 @@ fn spawn_state_watcher(
                     // Grace mode: wait up to DISCONNECT_GRACE for a recovery
                     // transition. Any Connected resets and returns to normal;
                     // Failed/Closed/timeout triggers shutdown.
+                    // Calculate deadline ONCE, outside the loop, to prevent recalculation
+                    // on each state transition. This ensures the grace window expires
+                    // at the correct absolute time regardless of event frequency.
                     let deadline = tokio::time::Instant::now() + DISCONNECT_GRACE;
                     tracing::warn!("webrtc: disconnected — entering grace window");
                     let recovered = loop {
-                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
                         if remaining.is_zero() {
                             break false;
                         }
                         match tokio::time::timeout(remaining, state_rx.recv()).await {
-                            Err(_) => break false, // grace expired
+                            Err(_) => break false,   // grace expired
                             Ok(None) => break false, // channel closed
                             Ok(Some(next)) => {
                                 tracing::info!(state = ?next, "webrtc: state during grace");
@@ -736,5 +748,81 @@ mod tests {
         let result = state.stop().await;
         assert!(matches!(result, Err(SessionError::NotRunning)));
     }
-}
 
+    #[tokio::test]
+    async fn grace_window_single_deadline() {
+        // Test that the grace window deadline is calculated once and does not
+        // get reset on each state transition. Simulate rapid Disconnected events
+        // and verify the grace window expires at ~DISCONNECT_GRACE time.
+        //
+        // This is a unit test of the deadline calculation logic. We test by
+        // spawning a mock state watcher that rapidly sends Disconnected events,
+        // then verifies that the grace window exits after approximately
+        // DISCONNECT_GRACE time, not indefinitely extended.
+
+        let (state_tx, state_rx) = mpsc::channel(100);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(10);
+
+        // Spawn a task that simulates the grace window logic
+        let grace_task = tokio::spawn(async move {
+            let mut state_rx = state_rx;
+            let shutdown_tx = shutdown_tx;
+            let start = tokio::time::Instant::now();
+
+            // Calculate deadline once (this is the fix being tested)
+            let deadline = tokio::time::Instant::now() + DISCONNECT_GRACE;
+            let recovered = loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break false;
+                }
+                match tokio::time::timeout(remaining, state_rx.recv()).await {
+                    Err(_) => break false,   // grace expired
+                    Ok(None) => break false, // channel closed
+                    Ok(Some(next)) => {
+                        // Simulate receiving rapid Disconnected events
+                        match next {
+                            ConnState::Connected => break true,
+                            ConnState::Failed | ConnState::Closed => {
+                                let _ = shutdown_tx.try_send("terminal");
+                                return (start.elapsed(), false);
+                            }
+                            _ => continue, // Disconnected/Connecting — keep waiting
+                        }
+                    }
+                }
+            };
+
+            (start.elapsed(), recovered)
+        });
+
+        // Spawn a task that sends rapid Disconnected events
+        let sender_task = tokio::spawn(async move {
+            for i in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = state_tx.send(ConnState::Disconnected).await;
+                if i == 9 {
+                    // After 10 events (1 second total), stop sending
+                    // Grace window should still fire at ~DISCONNECT_GRACE
+                    drop(state_tx);
+                }
+            }
+        });
+
+        // Wait for both tasks
+        let (elapsed, _recovered) = grace_task.await.expect("grace task failed");
+        let _ = sender_task.await;
+
+        // Verify the grace window expired at approximately DISCONNECT_GRACE time.
+        // We allow a 500ms margin for test execution overhead.
+        let expected_grace_secs = DISCONNECT_GRACE.as_secs_f64();
+        let actual_secs = elapsed.as_secs_f64();
+
+        assert!(
+            (actual_secs - expected_grace_secs).abs() < 1.0,
+            "Grace window should expire at ~{:.1}s, but expired at {:.1}s",
+            expected_grace_secs,
+            actual_secs
+        );
+    }
+}

@@ -160,7 +160,11 @@ mod windows_impl {
         type Error = Box<dyn std::error::Error + Send + Sync>;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let Flags { tx, start, stopping } = ctx.flags;
+            let Flags {
+                tx,
+                start,
+                stopping,
+            } = ctx.flags;
             Ok(Self {
                 tx,
                 start,
@@ -252,9 +256,7 @@ mod windows_impl {
         for (idx, m) in monitors.into_iter().enumerate() {
             let width = m.width().unwrap_or(0);
             let height = m.height().unwrap_or(0);
-            let name = m
-                .device_name()
-                .unwrap_or_else(|_| format!("Monitor {idx}"));
+            let name = m.device_name().unwrap_or_else(|_| format!("Monitor {idx}"));
             let is_primary = primary
                 .as_ref()
                 .map(|p| p.index().ok() == m.index().ok())
@@ -270,10 +272,7 @@ mod windows_impl {
         Ok(out)
     }
 
-    pub fn start(
-        monitor_index: usize,
-        tx: mpsc::Sender<RawFrame>,
-    ) -> Result<Handle, CaptureError> {
+    pub fn start(monitor_index: usize, tx: mpsc::Sender<RawFrame>) -> Result<Handle, CaptureError> {
         let monitors = Monitor::enumerate()
             .map_err(|e| CaptureError::Failed(format!("monitor enumerate: {e:?}")))?;
         // Bounds check via .get() + .ok_or() is safe; handles monitor disconnect gracefully
@@ -337,7 +336,10 @@ mod tests {
         // monitors, which is rare). This is a smoke-check; the Monitor::enumerate
         // contract is verified by windows-capture crate tests.
         #[cfg(target_os = "windows")]
-        assert!(!monitors.is_empty(), "Windows test must have at least one monitor");
+        assert!(
+            !monitors.is_empty(),
+            "Windows test must have at least one monitor"
+        );
     }
 
     #[test]
@@ -362,4 +364,3 @@ mod tests {
         }
     }
 }
-

@@ -39,10 +39,16 @@ class SessionManager {
   joinSession(pin, viewerWs) {
     const session = this.sessions.get(pin);
     if (!session) return { error: 'invalid_pin' };
-    if (session.state !== 'waiting') return { error: 'session_in_use' };
+    if (session.state !== 'waiting') {
+      // Log internal error state for debugging but return generic error to client
+      console.warn('[ghostview] session in use for pin %s, state: %s', pin, session.state);
+      return { error: 'invalid_pin' };
+    }
     if (Date.now() - session.created > this.PIN_TTL) {
+      // Log expiry internally but return generic error to client
+      console.info('[ghostview] pin expired for pin %s, ttl: %d ms', pin, this.PIN_TTL);
       this.destroySession(pin);
-      return { error: 'pin_expired' };
+      return { error: 'invalid_pin' };
     }
     session.viewer = viewerWs;
     session.state = 'paired';

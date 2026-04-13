@@ -40,16 +40,11 @@ async fn start_session(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, String> {
     let mut guard = state.lock().await;
-    guard
-        .start(monitor_index)
-        .await
-        .map_err(|e| e.to_string())
+    guard.start(monitor_index).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn stop_session(
-    state: tauri::State<'_, Arc<Mutex<AppState>>>,
-) -> Result<(), String> {
+async fn stop_session(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
     let mut guard = state.lock().await;
     guard.stop().await.map_err(|e| e.to_string())
 }
