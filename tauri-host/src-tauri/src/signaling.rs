@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Minimal signaling WebSocket client.
 //!
 //! Connects to the GhostView signaling server, registers a session (receiving a
@@ -222,19 +221,35 @@ pub async fn connect(url: &str) -> Result<SignalingClient, SignalingError> {
     let pump_slot = Arc::clone(&created_slot);
 
     // Outbound pump: serialize ClientMessage -> WsMessage::Text. Exits when the
-    // last Sender (held by SignalingClient) is dropped.
+    // last Sender (held by SignalingClient) is dropped. Also drives a 20 s
+    // keepalive ping — under common NAT UDP idle timeouts (~30 s) and well
+    // under idle TCP timeouts — so the signaling path stays warm even when
+    // the WebRTC data path is carrying all the traffic.
     let outbound = async move {
-        while let Some(msg) = client_rx.recv().await {
-            let text = match serde_json::to_string(&msg) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!(error = %e, "signaling: serialize failed");
-                    continue;
+        let mut keepalive = tokio::time::interval(Duration::from_secs(20));
+        keepalive.tick().await; // consume the immediate first tick
+        loop {
+            tokio::select! {
+                maybe = client_rx.recv() => {
+                    let Some(msg) = maybe else { break };
+                    let text = match serde_json::to_string(&msg) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!(error = %e, "signaling: serialize failed");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = ws_tx.send(WsMessage::Text(text)).await {
+                        tracing::warn!(error = %e, "signaling: ws send failed, exiting pump");
+                        break;
+                    }
                 }
-            };
-            if let Err(e) = ws_tx.send(WsMessage::Text(text)).await {
-                tracing::warn!(error = %e, "signaling: ws send failed, exiting pump");
-                break;
+                _ = keepalive.tick() => {
+                    if let Err(e) = ws_tx.send(WsMessage::Ping(Vec::new())).await {
+                        tracing::warn!(error = %e, "signaling: keepalive ping failed, exiting pump");
+                        break;
+                    }
+                }
             }
         }
         let _ = ws_tx.close().await;

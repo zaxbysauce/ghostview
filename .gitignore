@@ -21,6 +21,9 @@ certs/
 *.key
 *.crt
 
+# TURN credentials live here; copy turnserver.conf.example and edit locally.
+turnserver.conf
+
 # Environment
 .env
 .env.local

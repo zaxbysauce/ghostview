@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! VP9 software encoder.
 //!
 //! Thin wrapper around [`vpx_encode::Encoder`]. Input is BGRA (as produced by

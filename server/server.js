@@ -10,6 +10,18 @@ const HOST = process.env.HOST || '0.0.0.0';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean);
 // Only honor X-Forwarded-For when explicitly told we're behind a trusted proxy.
 const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const ALLOW_INSECURE = /^(1|true|yes)$/i.test(process.env.ALLOW_INSECURE || '');
+
+// In production, an empty ALLOWED_ORIGINS would silently allow any origin —
+// refuse to start. Dev keeps the permissive fallback so self-signed setups
+// don't require the operator to set the env var.
+if (IS_PRODUCTION && ALLOWED_ORIGINS.length === 0) {
+  console.error(
+    '[ghostview] FATAL: ALLOWED_ORIGINS must be set in production (comma-separated list of https:// origins)'
+  );
+  process.exit(1);
+}
 
 const sessions = new SessionManager();
 
@@ -19,6 +31,18 @@ const CERT_PATH = join(CERT_DIR, 'cert.pem');
 const KEY_PATH = join(CERT_DIR, 'key.pem');
 
 const useTLS = existsSync(CERT_PATH) && existsSync(KEY_PATH);
+
+// In production, refuse to start without TLS unless the operator has
+// explicitly opted in with ALLOW_INSECURE=1 (useful for TLS-terminating
+// reverse proxies that forward plain HTTP to the app).
+if (IS_PRODUCTION && !useTLS && !ALLOW_INSECURE) {
+  console.error(
+    '[ghostview] FATAL: TLS certs required in production. Place cert.pem + key.pem under ./certs, ' +
+    'or set ALLOW_INSECURE=1 if terminating TLS at a reverse proxy.'
+  );
+  process.exit(1);
+}
+
 const httpServer = useTLS
   ? createHttpsServer({
       cert: readFileSync(CERT_PATH),
@@ -27,8 +51,13 @@ const httpServer = useTLS
   : createHttpServer();
 
 if (!useTLS) {
-  console.warn('[ghostview] TLS certs not found in ./certs — serving plain HTTP.');
-  console.warn('[ghostview] getDisplayMedia requires HTTPS; generate self-signed certs for dev.');
+  console.warn('[ghostview] ====================================================================');
+  console.warn('[ghostview]  WARNING: TLS certs not found in ./certs — serving plain HTTP.');
+  console.warn('[ghostview]  getDisplayMedia() requires HTTPS; browsers will refuse to capture');
+  console.warn('[ghostview]  unless served over HTTPS or from localhost. Generate dev certs with:');
+  console.warn('[ghostview]    openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem \\');
+  console.warn('[ghostview]      -out certs/cert.pem -days 365 -nodes -subj "/CN=localhost"');
+  console.warn('[ghostview] ====================================================================');
 }
 
 const MIME = {
@@ -165,6 +194,15 @@ wss.on('connection', (ws, req) => {
   // Per-connection counter for join-session misses.
   ws._wrongPins = 0;
 
+  // Keepalive: ping every 25s. Most NATs drop idle UDP at 30s and idle TCP
+  // well under 300s, so a 25s tempo keeps the path warm for the signaling
+  // channel even when the WebRTC media path goes quiet. `ws.ping()` waits
+  // for a pong frame; if none arrives before the next tick, the library's
+  // internal tracking marks the socket as stale and subsequent `send()`s
+  // will fail — our message handler already tolerates that.
+  ws._isAlive = true;
+  ws.on('pong', () => { ws._isAlive = true; });
+
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
@@ -222,6 +260,21 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => sessions.handleDisconnect(ws));
   ws.on('error', () => sessions.handleDisconnect(ws));
 });
+
+// Keepalive sweep: ping every 25s; terminate any socket that didn't pong
+// since the previous sweep. Bounded overhead — O(clients).
+const KEEPALIVE_INTERVAL = 25_000;
+const keepaliveTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws._isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws._isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, KEEPALIVE_INTERVAL);
+keepaliveTimer.unref?.();
 
 httpServer.listen(PORT, HOST, () => {
   const scheme = useTLS ? 'https' : 'http';

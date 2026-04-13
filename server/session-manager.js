@@ -58,7 +58,14 @@ class SessionManager {
 
     const target = (senderWs === session.host) ? session.viewer : session.host;
     if (target?.readyState === 1) {
-      target.send(JSON.stringify(message));
+      // ws.send throws synchronously on some transport failures; never let
+      // a relay failure kill the calling message handler and leak the
+      // session — log and continue. handleDisconnect will tidy up later.
+      try {
+        target.send(JSON.stringify(message));
+      } catch (err) {
+        console.warn('[ghostview] relay send failed:', err?.message || err);
+      }
     }
   }
 
@@ -89,14 +96,30 @@ class SessionManager {
   }
 
   _cleanup() {
-    const now = Date.now();
-    for (const [pin, session] of this.sessions) {
-      if (session.state === 'waiting' && now - session.created > this.PIN_TTL) {
-        if (session.host?.readyState === 1) {
-          session.host.send(JSON.stringify({ type: 'session-expired' }));
+    if (this._cleanupRunning) return; // non-reentrant
+    this._cleanupRunning = true;
+    try {
+      const now = Date.now();
+      for (const [pin, session] of this.sessions) {
+        if (session.state === 'waiting' && now - session.created > this.PIN_TTL) {
+          // Wrap the whole iteration so a send failure cannot skip the
+          // destroy — expired sessions MUST be reclaimed regardless.
+          try {
+            if (session.host?.readyState === 1) {
+              session.host.send(JSON.stringify({ type: 'session-expired' }));
+            }
+          } catch (err) {
+            console.warn('[ghostview] session-expired notify failed:', err?.message || err);
+          }
+          try {
+            this.destroySession(pin);
+          } catch (err) {
+            console.error('[ghostview] destroySession failed:', err?.message || err);
+          }
         }
-        this.destroySession(pin);
       }
+    } finally {
+      this._cleanupRunning = false;
     }
   }
 }

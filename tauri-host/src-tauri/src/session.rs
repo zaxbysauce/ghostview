@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Session orchestration.
 //!
 //! [`AppState`] owns the current session as an `Arc<Mutex<Option<Running>>>`
@@ -116,8 +115,22 @@ impl Running {
         abort_after(self.encoder_forwarder, Duration::from_millis(500)).await;
         if let Some(h) = self.encoder_blocking.take() {
             // The blocking encoder loop exits when frame_rx closes (capture
-            // stopped above), so a short join window is sufficient.
-            abort_after(h, Duration::from_millis(1000)).await;
+            // stopped above). If it hasn't exited within 1s, capture must be
+            // hung on a WGC callback — abort the blocking task and log loudly.
+            // Note: aborting a spawn_blocking thread is best-effort; the
+            // libvpx OS thread may leak until process exit. Accept that and
+            // surface it to the operator.
+            let budget = Duration::from_millis(1000);
+            let abort_handle = h.abort_handle();
+            match tokio::time::timeout(budget, h).await {
+                Ok(_) => {}
+                Err(_) => {
+                    tracing::error!(
+                        "encoder: blocking thread did not exit within {budget:?} after capture stop — aborting (libvpx thread may leak until process exit)"
+                    );
+                    abort_handle.abort();
+                }
+            }
         }
         abort_after(self.signaling_task, Duration::from_millis(500)).await;
         abort_after(self.ice_forward_task, Duration::from_millis(200)).await;
@@ -150,6 +163,10 @@ impl AppState {
     }
 
     /// Start a new session. Returns the 6-digit PIN the viewer will enter.
+    ///
+    /// The inner helper returns a fully-initialized `Running`. Any error on
+    /// the way — signaling, WebRTC, capture — is caught here and the partial
+    /// state is unwound in reverse order so we never leak a background task.
     pub async fn start(&mut self, monitor_index: usize) -> Result<String, SessionError> {
         {
             let guard = self.slot.lock().await;
@@ -158,81 +175,13 @@ impl AppState {
             }
         }
 
-        // --- Signaling: connect + get PIN --------------------------------------
-        let url = signaling_url();
-        tracing::info!(%url, "signaling: connecting");
-        let mut client = signaling::connect(&url).await?;
-        let pin = client.create_session().await?;
-        tracing::info!(%pin, "session: created");
+        let (running, shutdown_rx) = Self::init_running(monitor_index).await?;
+        let pin = running.pin.clone();
 
-        // --- WebRTC host -------------------------------------------------------
-        let webrtc = Arc::new(WebRtcHost::new(ice_servers()).await?);
-
-        // --- Capture + encoder -------------------------------------------------
-        let (frame_tx, frame_rx) = mpsc::channel::<RawFrame>(4);
-        let capture = capture::start(monitor_index, frame_tx)?;
-
-        // Pick encoder dimensions from the chosen monitor, defaulting to 1080p.
-        // The encoder task will auto-reinit if the actual capture resolution
-        // differs (e.g. mixed-DPI monitors or post-start display changes).
-        let (w, h) = capture::list_monitors()
-            .into_iter()
-            .find(|m| m.index == monitor_index)
-            .map(|m| (even(m.width, 1920), even(m.height, 1080)))
-            .unwrap_or((1920, 1080));
-
-        let (encoder_blocking, encoder_forwarder) =
-            spawn_encoder_pair(w, h, frame_rx, Arc::clone(&webrtc));
-
-        // --- Signaling pumps ---------------------------------------------------
-        let events = client
-            .take_events()
-            .ok_or_else(|| SessionError::Signaling(SignalingError::Protocol(
-                "signaling events already taken".into(),
-            )))?;
-        let client_tx = client.sender().ok_or_else(|| {
-            SessionError::Signaling(SignalingError::Protocol(
-                "signaling sender unavailable".into(),
-            ))
-        })?;
-
-        // Single shutdown signal with two senders (signaling loop + state
-        // watcher) and one receiver (the supervisor).
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<&'static str>(4);
-
-        let signaling_task = spawn_signaling_loop(
-            events,
-            client_tx.clone(),
-            Arc::clone(&webrtc),
-            shutdown_tx.clone(),
-        );
-
-        // Forward local ICE candidates → signaling.
-        let ice_rx = webrtc.take_ice_stream().await.ok_or_else(|| {
-            SessionError::WebRtc(WebRtcError::State("ice stream already taken".into()))
-        })?;
-        let ice_forward_task = spawn_ice_forwarder(ice_rx, client_tx.clone());
-
-        // Watch peer-connection state for Failed/Closed → trigger shutdown.
-        let state_rx = webrtc.take_state_stream().await.ok_or_else(|| {
-            SessionError::WebRtc(WebRtcError::State("state stream already taken".into()))
-        })?;
-        let state_task = spawn_state_watcher(state_rx, shutdown_tx.clone());
-
-        // Install Running in the slot.
+        // Install into the slot.
         {
             let mut guard = self.slot.lock().await;
-            *guard = Some(Running {
-                pin: pin.clone(),
-                capture,
-                encoder_forwarder,
-                encoder_blocking: Some(encoder_blocking),
-                signaling_task,
-                ice_forward_task,
-                state_task,
-                signaling: client,
-                webrtc,
-            });
+            *guard = Some(running);
         }
 
         // Supervisor: on first shutdown signal, take the Running out of the
@@ -272,6 +221,166 @@ impl AppState {
         running.teardown().await;
         tracing::info!("session: teardown complete (local stop)");
         Ok(())
+    }
+
+    /// Build a fully-initialized `Running` + shutdown receiver.
+    ///
+    /// The partial-init state (signaling client, WebRTC, capture, tasks) is
+    /// accumulated in `PartialInit`. If any step fails, `PartialInit::cleanup`
+    /// awaits teardown of whatever was built before returning the error.
+    async fn init_running(
+        monitor_index: usize,
+    ) -> Result<(Running, mpsc::Receiver<&'static str>), SessionError> {
+        let mut partial = PartialInit::default();
+
+        let result = async {
+            // --- Signaling: connect + get PIN ---------------------------------
+            let url = signaling_url();
+            tracing::info!(%url, "signaling: connecting");
+            let mut client = signaling::connect(&url).await?;
+            let pin = client.create_session().await?;
+            tracing::info!(%pin, "session: created");
+            partial.signaling = Some(client);
+
+            // --- WebRTC host --------------------------------------------------
+            let webrtc = Arc::new(WebRtcHost::new(ice_servers()).await?);
+            partial.webrtc = Some(Arc::clone(&webrtc));
+
+            // --- Capture + encoder -------------------------------------------
+            let (frame_tx, frame_rx) = mpsc::channel::<RawFrame>(4);
+            let capture = capture::start(monitor_index, frame_tx)?;
+            partial.capture = Some(capture);
+
+            let (w, h) = capture::list_monitors()
+                .into_iter()
+                .find(|m| m.index == monitor_index)
+                .map(|m| (even(m.width, 1920), even(m.height, 1080)))
+                .unwrap_or((1920, 1080));
+
+            let (encoder_blocking, encoder_forwarder) =
+                spawn_encoder_pair(w, h, frame_rx, Arc::clone(&webrtc));
+            partial.encoder_blocking = Some(encoder_blocking);
+            partial.encoder_forwarder = Some(encoder_forwarder);
+
+            // --- Signaling pumps ---------------------------------------------
+            let events = partial
+                .signaling
+                .as_mut()
+                .unwrap()
+                .take_events()
+                .ok_or_else(|| {
+                    SessionError::Signaling(SignalingError::Protocol(
+                        "signaling events already taken".into(),
+                    ))
+                })?;
+            let client_tx = partial.signaling.as_ref().unwrap().sender().ok_or_else(|| {
+                SessionError::Signaling(SignalingError::Protocol(
+                    "signaling sender unavailable".into(),
+                ))
+            })?;
+
+            let (shutdown_tx, shutdown_rx) = mpsc::channel::<&'static str>(4);
+
+            let signaling_task = spawn_signaling_loop(
+                events,
+                client_tx.clone(),
+                Arc::clone(&webrtc),
+                shutdown_tx.clone(),
+            );
+            partial.signaling_task = Some(signaling_task);
+
+            let ice_rx = webrtc.take_ice_stream().await.ok_or_else(|| {
+                SessionError::WebRtc(WebRtcError::State("ice stream already taken".into()))
+            })?;
+            let ice_forward_task = spawn_ice_forwarder(ice_rx, client_tx.clone());
+            partial.ice_forward_task = Some(ice_forward_task);
+
+            let state_rx = webrtc.take_state_stream().await.ok_or_else(|| {
+                SessionError::WebRtc(WebRtcError::State("state stream already taken".into()))
+            })?;
+            let state_task = spawn_state_watcher(state_rx, shutdown_tx.clone());
+            partial.state_task = Some(state_task);
+
+            Ok::<_, SessionError>((pin, shutdown_rx))
+        }
+        .await;
+
+        match result {
+            Ok((pin, shutdown_rx)) => {
+                // Consume partial into Running — every field is Some at this point.
+                let running = Running {
+                    pin,
+                    capture: partial.capture.take().expect("capture"),
+                    encoder_forwarder: partial.encoder_forwarder.take().expect("forwarder"),
+                    encoder_blocking: Some(
+                        partial.encoder_blocking.take().expect("encoder_blocking"),
+                    ),
+                    signaling_task: partial.signaling_task.take().expect("signaling_task"),
+                    ice_forward_task: partial
+                        .ice_forward_task
+                        .take()
+                        .expect("ice_forward_task"),
+                    state_task: partial.state_task.take().expect("state_task"),
+                    signaling: partial.signaling.take().expect("signaling"),
+                    webrtc: partial.webrtc.take().expect("webrtc"),
+                };
+                Ok((running, shutdown_rx))
+            }
+            Err(e) => {
+                partial.cleanup().await;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Accumulator for `AppState::init_running`. On the success path, every field
+/// is consumed into a `Running`. On the error path, `cleanup().await` runs
+/// teardown in reverse init order over whatever fields are populated.
+#[derive(Default)]
+struct PartialInit {
+    signaling: Option<SignalingClient>,
+    webrtc: Option<Arc<WebRtcHost>>,
+    capture: Option<CaptureHandle>,
+    encoder_blocking: Option<JoinHandle<()>>,
+    encoder_forwarder: Option<JoinHandle<()>>,
+    signaling_task: Option<JoinHandle<()>>,
+    ice_forward_task: Option<JoinHandle<()>>,
+    state_task: Option<JoinHandle<()>>,
+}
+
+impl PartialInit {
+    async fn cleanup(mut self) {
+        // Mirror Running::teardown order: signaling first (stop protocol),
+        // capture next (halt frame source so encoder drains), webrtc, then
+        // tasks. Each step is awaited best-effort.
+        if let Some(mut sig) = self.signaling.take() {
+            let _ = sig.send(ClientMessage::EndSession).await;
+            sig.close().await;
+        }
+        if let Some(mut cap) = self.capture.take() {
+            cap.stop().await;
+        }
+        if let Some(webrtc) = self.webrtc.take() {
+            if let Err(e) = webrtc.close().await {
+                tracing::warn!(error = %e, "webrtc: close failed during partial cleanup");
+            }
+        }
+        if let Some(h) = self.encoder_forwarder.take() {
+            abort_after(h, Duration::from_millis(500)).await;
+        }
+        if let Some(h) = self.encoder_blocking.take() {
+            abort_after(h, Duration::from_millis(1000)).await;
+        }
+        if let Some(h) = self.signaling_task.take() {
+            abort_after(h, Duration::from_millis(500)).await;
+        }
+        if let Some(h) = self.ice_forward_task.take() {
+            abort_after(h, Duration::from_millis(200)).await;
+        }
+        if let Some(h) = self.state_task.take() {
+            abort_after(h, Duration::from_millis(200)).await;
+        }
     }
 }
 
@@ -316,7 +425,11 @@ fn spawn_encoder_pair(
                 None
             }
         };
-        let mut last_pts: u64 = 0;
+        // `None` until the first frame arrives, so the inter-frame delta on
+        // frame 1 isn't `pts - 0 = pts_ms` (which can be a huge spike). First
+        // frame gets a nominal 33ms duration (≈30fps) until a real delta is
+        // available.
+        let mut last_pts: Option<u64> = None;
 
         while let Some(frame) = frame_rx.blocking_recv() {
             // Dimension change → reinit. WGC can deliver odd sizes after DPI
@@ -352,8 +465,11 @@ fn spawn_encoder_pair(
             match enc.encode(&frame.bgra, frame.pts_ms) {
                 Ok(pkt) if pkt.is_empty() => {}
                 Ok(pkt) => {
-                    let duration_ms = frame.pts_ms.saturating_sub(last_pts).max(1);
-                    last_pts = frame.pts_ms;
+                    let duration_ms = match last_pts {
+                        Some(prev) => frame.pts_ms.saturating_sub(prev).max(1),
+                        None => 33, // nominal ≈30 FPS for frame 1
+                    };
+                    last_pts = Some(frame.pts_ms);
                     if enc_tx.blocking_send((pkt, duration_ms)).is_err() {
                         break; // forwarder gone
                     }
@@ -472,34 +588,51 @@ fn spawn_ice_forwarder(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(c) = ice_rx.recv().await {
-            let init = IceCandidateInit {
-                candidate: c.candidate,
-                sdp_mid: c.sdp_mid,
-                sdp_mline_index: c.sdp_mline_index,
-                username_fragment: c.username_fragment,
+            // Empty candidate string marks webrtc-rs's end-of-candidates
+            // sentinel — forward as `{candidate: null}` on the wire, which
+            // matches the browser's RTCIceCandidate null semantics.
+            let outbound = if c.candidate.is_empty() {
+                ClientMessage::IceCandidate { candidate: None }
+            } else {
+                ClientMessage::IceCandidate {
+                    candidate: Some(IceCandidateInit {
+                        candidate: c.candidate,
+                        sdp_mid: c.sdp_mid,
+                        sdp_mline_index: c.sdp_mline_index,
+                        username_fragment: c.username_fragment,
+                    }),
+                }
             };
-            if let Err(e) = client_tx
-                .send(ClientMessage::IceCandidate {
-                    candidate: Some(init),
-                })
-                .await
-            {
+            if let Err(e) = client_tx.send(outbound).await {
                 tracing::debug!(error = %e, "signaling: ice relay channel closed");
                 break;
             }
         }
-        // End-of-candidates sentinel.
+        // If the ice stream closes without emitting a sentinel (e.g. pc was
+        // closed abruptly), best-effort send one final null so the viewer
+        // doesn't keep waiting for more candidates.
         let _ = client_tx
             .send(ClientMessage::IceCandidate { candidate: None })
             .await;
     })
 }
 
+/// Grace window for transient ICE `Disconnected` before tearing down.
+///
+/// webrtc-rs / Chrome / Firefox all emit `Disconnected` roughly 5 s after
+/// the last successful ICE consent-freshness check. Many real networks
+/// recover within a few seconds (Wi-Fi roaming, brief packet loss). Firing
+/// teardown at 5 s double-counts that window; 15 s matches the common
+/// ICE-restart heuristic and lets short hiccups self-heal.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
 fn spawn_state_watcher(
     mut state_rx: mpsc::Receiver<ConnState>,
     shutdown_tx: mpsc::Sender<&'static str>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Outer loop: normal state transitions until we see Failed/Closed
+        // (immediate teardown) or Disconnected (enter grace mode).
         while let Some(s) = state_rx.recv().await {
             tracing::info!(state = ?s, "webrtc: connection state");
             match s {
@@ -510,6 +643,40 @@ fn spawn_state_watcher(
                 ConnState::Closed => {
                     let _ = shutdown_tx.try_send("ice_closed");
                     break;
+                }
+                ConnState::Disconnected => {
+                    // Grace mode: wait up to DISCONNECT_GRACE for a recovery
+                    // transition. Any Connected resets and returns to normal;
+                    // Failed/Closed/timeout triggers shutdown.
+                    let deadline = tokio::time::Instant::now() + DISCONNECT_GRACE;
+                    tracing::warn!("webrtc: disconnected — entering grace window");
+                    let recovered = loop {
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            break false;
+                        }
+                        match tokio::time::timeout(remaining, state_rx.recv()).await {
+                            Err(_) => break false, // grace expired
+                            Ok(None) => break false, // channel closed
+                            Ok(Some(next)) => {
+                                tracing::info!(state = ?next, "webrtc: state during grace");
+                                match next {
+                                    ConnState::Connected => break true,
+                                    ConnState::Failed | ConnState::Closed => {
+                                        let _ = shutdown_tx.try_send("ice_disconnected_terminal");
+                                        return;
+                                    }
+                                    _ => continue, // Connecting/Disconnected — keep waiting
+                                }
+                            }
+                        }
+                    };
+                    if !recovered {
+                        let _ = shutdown_tx.try_send("ice_disconnected_timeout");
+                        return;
+                    }
+                    tracing::info!("webrtc: recovered from disconnected");
+                    // Fall through to continue the outer loop.
                 }
                 _ => {}
             }

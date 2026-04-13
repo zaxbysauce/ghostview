@@ -17,7 +17,7 @@ Phase 1 — view-only remote assistance. See the in-repo design doc (commit mess
 | Capture | `getDisplayMedia()` | `windows-capture` (Windows-only) |
 | Frame rate | 15–30 FPS | Up to 60 FPS |
 | Remote control (Phase 2) | Never | Planned via `enigo` |
-| Status | Fully implemented | Scaffold — real capture/webrtc wiring pending |
+| Status | Fully implemented | Wired — capture → VP9 → WebRTC → signaling roundtrip passing |
 
 ## Repository layout
 
@@ -34,9 +34,9 @@ ghostview/
 ├── tauri-host/          # GhostView Pro — Tauri 2.0 scaffold
 │   ├── src-tauri/       # Rust backend (capture, WebRTC, signaling)
 │   └── src/             # Minimal HTML/CSS/JS frontend
-├── docker-compose.yml   # Signaling + coturn (STUN/TURN)
-├── turnserver.conf      # coturn config — edit before production use
-└── certs/               # TLS certs (not committed)
+├── docker-compose.yml       # Signaling + coturn (STUN/TURN)
+├── turnserver.conf.example  # coturn config TEMPLATE — copy to turnserver.conf (gitignored) and edit
+└── certs/                   # TLS certs (not committed)
 ```
 
 ## Quick start — local dev
@@ -66,11 +66,17 @@ Your browser will warn about the self-signed cert; accept it in both tabs.
 ### 2. STUN/TURN (optional, for connections across NAT)
 
 ```bash
-# Edit turnserver.conf first — change the `user=` password and set `external-ip`.
+# Copy the template, fill in credentials, then start the container.
+cp turnserver.conf.example turnserver.conf
+# Edit turnserver.conf:
+#   realm=<your.domain>
+#   user=<username>:<strong-random-password>
+#   external-ip=<public-ip>     # uncomment if behind NAT
 docker compose up -d coturn
 ```
 
-Then add your TURN server to the ICE config in `server/public/assets/ghostview-viewer.js` and `ghostview-host-lite.js`.
+`turnserver.conf` is gitignored so credentials never reach the repo.
+Reference it from the ICE config in `server/public/assets/ghostview-viewer.js` and `ghostview-host-lite.js`, and from the Tauri host via the `GHOSTVIEW_ICE_SERVERS` env var.
 
 ### 3. GhostView Pro scaffold
 
@@ -105,11 +111,30 @@ Before producing a release bundle you must add `icons/icon.ico`, `icon.png`, `32
 
 ```bash
 # Put real TLS certs in ./certs/cert.pem and ./certs/key.pem.
-# Edit turnserver.conf: set realm, user password, and external-ip.
+cp turnserver.conf.example turnserver.conf
+# Edit turnserver.conf: set realm, strong user password, and external-ip.
+NODE_ENV=production \
+ALLOWED_ORIGINS=https://your.domain \
 docker compose up -d
 ```
 
+`NODE_ENV=production` makes the signaling server refuse to start without TLS
+certs (unless `ALLOW_INSECURE=1` is set — use only when a reverse proxy
+terminates TLS) and without `ALLOWED_ORIGINS` set. See the Security model
+section below.
+
 One small VPS (1 vCPU, 512 MB RAM) handles ~100 concurrent sessions for signaling; TURN bandwidth is the real cost driver.
+
+## Phase 2 roadmap
+
+- **Remote control (keyboard + mouse)** via the `enigo` crate on the Pro host.
+- **Clipboard sync** via `arboard`.
+- **Short-term TURN credentials** — signaling server issues HMAC-SHA1
+  time-limited username/password per-session, rotating a shared secret with
+  coturn's `use-auth-secret` mode.
+- **File transfer** through a WebRTC data channel.
+- **macOS / Linux Pro host** — port the `windows-capture` code path to
+  `screencapturekit` (macOS) and `pipewire` (Linux).
 
 ## Security model
 

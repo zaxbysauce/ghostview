@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! WebRTC peer-connection host.
 //!
 //! Wraps a single [`RTCPeerConnection`] with a pre-attached VP9 video track.
@@ -172,21 +171,34 @@ impl WebRtcHost {
         pc.on_ice_candidate(Box::new(move |cand| {
             let tx = ice_tx.clone();
             Box::pin(async move {
-                let Some(c) = cand else {
-                    return; // end-of-candidates; browsers send `null` via signaling
-                };
-                let init = match c.to_json() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "webrtc: ice candidate to_json failed");
-                        return;
+                let local = match cand {
+                    Some(c) => {
+                        let init = match c.to_json() {
+                            Ok(j) => j,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "webrtc: ice candidate to_json failed");
+                                return;
+                            }
+                        };
+                        LocalIceCandidate {
+                            candidate: init.candidate,
+                            sdp_mid: init.sdp_mid,
+                            sdp_mline_index: init.sdp_mline_index,
+                            username_fragment: init.username_fragment,
+                        }
                     }
-                };
-                let local = LocalIceCandidate {
-                    candidate: init.candidate,
-                    sdp_mid: init.sdp_mid,
-                    sdp_mline_index: init.sdp_mline_index,
-                    username_fragment: init.username_fragment,
+                    None => {
+                        // End-of-candidates sentinel. Forward it so signaling
+                        // can send `{candidate: null}` to the viewer. The
+                        // forwarder distinguishes the sentinel by empty
+                        // `candidate` string.
+                        LocalIceCandidate {
+                            candidate: String::new(),
+                            sdp_mid: None,
+                            sdp_mline_index: None,
+                            username_fragment: None,
+                        }
+                    }
                 };
                 if tx.send(local).await.is_err() {
                     tracing::debug!("webrtc: ice candidate channel closed");

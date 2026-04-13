@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Screen capture.
 //!
 //! Phase 1 target: Windows 10/11 via the `windows-capture` crate (Windows
