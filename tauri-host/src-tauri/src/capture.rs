@@ -85,6 +85,12 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
 
 /// Start capturing `monitor_index`. Frames are delivered on `tx` until the
 /// returned [`CaptureHandle`] is dropped or `stop().await` is called.
+///
+/// # Phase 2 roadmap
+///
+/// - Make cursor capture configurable. Currently hardcoded to
+///   `CursorCaptureSettings::WithCursor`; accept an optional param and plumb
+///   it through `AppState::start` → Tauri IPC.
 pub fn start(
     monitor_index: usize,
     tx: mpsc::Sender<RawFrame>,
@@ -109,6 +115,15 @@ mod windows_impl {
     //! a dedicated capture thread; we copy the BGRA buffer (the underlying
     //! frame memory is owned by the Graphics Capture API and must not outlive
     //! the callback) and forward it over an mpsc channel.
+    //!
+    //! # COM Apartment
+    //!
+    //! The Windows Graphics Capture API and `windows-capture` internally
+    //! initialize a COM Single-Threaded Apartment (STA). Our `std::thread::spawn`
+    //! is the correct host for this initialization: the dedicated OS thread
+    //! isolates COM STA state and prevents conflicts with Tokio's multi-threaded
+    //! runtime (which may not have COM initialized). The capture thread will
+    //! initialize and tear down COM as needed on entry/exit.
 
     use super::{CaptureError, RawFrame};
     use crate::MonitorInfo;
@@ -300,3 +315,25 @@ mod windows_impl {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_monitors_returns_expected_type() {
+        // On Windows, list_monitors calls Monitor::enumerate and returns
+        // MonitorInfo with device_name, width, height, is_primary.
+        // On non-Windows, returns an empty vec (by design).
+        let monitors = list_monitors();
+        // On this Linux test runner, expect empty.
+        #[cfg(not(target_os = "windows"))]
+        assert!(monitors.is_empty());
+        // On Windows, the list should be nonempty (or the test system has no
+        // monitors, which is rare). This is a smoke-check; the Monitor::enumerate
+        // contract is verified by windows-capture crate tests.
+        #[cfg(target_os = "windows")]
+        assert!(!monitors.is_empty(), "Windows test must have at least one monitor");
+    }
+}
+

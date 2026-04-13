@@ -76,7 +76,23 @@ docker compose up -d coturn
 ```
 
 `turnserver.conf` is gitignored so credentials never reach the repo.
-Reference it from the ICE config in `server/public/assets/ghostview-viewer.js` and `ghostview-host-lite.js`, and from the Tauri host via the `GHOSTVIEW_ICE_SERVERS` env var.
+
+#### TURNS (TLS-wrapped TURN) for corporate firewalls
+
+If your network blocks plain UDP 3478, enable TURNS in `turnserver.conf`:
+
+```
+cert=/path/to/cert.pem
+pkey=/path/to/key.pem
+cipher-list=ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20
+tls-listening-port=5349
+```
+
+Then reference the TURNS server in your ICE config (viewer, Lite host, Pro host) using `turns://<your-server>:5349`.
+
+---
+
+Reference the TURN server from the ICE config in `server/public/assets/ghostview-viewer.js` and `ghostview-host-lite.js`, and from the Tauri host via the `GHOSTVIEW_ICE_SERVERS` env var.
 
 ### 3. GhostView Pro scaffold
 
@@ -144,6 +160,7 @@ One small VPS (1 vCPU, 512 MB RAM) handles ~100 concurrent sessions for signalin
 - **Origin check:** Set `ALLOWED_ORIGINS` env on the signaling server for production.
 - **No persistence:** All session state lives in server memory; nothing is written to disk.
 - **Consent model:** Hosts must explicitly start sharing. Viewers cannot initiate capture.
+- **Pro host CSP:** Tauri's `tauri.conf.json` enforces a strict Content Security Policy (CSP) with no eval, no remote scripts, and limited inline styles. `dangerousRemoteDomainIpcAccess` is always empty in the committed config.
 
 ## License
 

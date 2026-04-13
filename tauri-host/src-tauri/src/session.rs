@@ -418,6 +418,9 @@ fn spawn_encoder_pair(
     let blocking = tokio::task::spawn_blocking(move || {
         let mut cur_w = initial_width;
         let mut cur_h = initial_height;
+        // Phase 2: scale bitrate by resolution. Today hardcoded at 4 Mbps;
+        // Phase 2 should tier: 2 Mbps for ≤720p, 4 Mbps for ≤1080p,
+        // 8 Mbps for ≤1440p, 16 Mbps for 2160p+ (requires quality testing).
         let mut encoder = match Vp9Encoder::new(cur_w, cur_h, 4_000) {
             Ok(e) => Some(e),
             Err(e) => {
@@ -701,3 +704,37 @@ fn even(v: u32, fallback: u32) -> u32 {
         v - 1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[cfg(target_os = "windows")]
+    async fn double_start_rejected() {
+        let mut state = AppState::new();
+        // On Windows, first start should succeed if monitor 0 exists.
+        // (If the test system has no monitors, this test will skip gracefully.)
+        match state.start(0).await {
+            Ok(_) => {
+                // First start succeeded. Now try a second start.
+                let result = state.start(0).await;
+                assert!(matches!(result, Err(SessionError::AlreadyRunning)));
+                // Teardown for cleanup.
+                let _ = state.stop().await;
+            }
+            Err(SessionError::Capture(CaptureError::MonitorNotFound(_))) => {
+                // Rare on test systems with displays, but gracefully skip.
+            }
+            Err(e) => panic!("unexpected error on first start: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_without_start_returns_not_running() {
+        let mut state = AppState::new();
+        let result = state.stop().await;
+        assert!(matches!(result, Err(SessionError::NotRunning)));
+    }
+}
+

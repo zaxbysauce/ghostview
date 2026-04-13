@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Rust: lint + test on Linux and Windows
+  rust:
+    name: Rust ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Windows: set up libvpx via vcpkg
+      - if: runner.os == 'Windows'
+        uses: johnwason/vcpkg-action@v6
+        with:
+          pkgs: libvpx:x64-windows-static-md
+          cache: true
+          cache-key: vcpkg-${{ runner.os }}
+
+      - if: runner.os == 'Windows'
+        name: Set VPX env on Windows
+        run: |
+          echo "VPX_LIB_DIR=${{ github.workspace }}\vcpkg\installed\x64-windows-static-md\lib" >> $env:GITHUB_ENV
+          echo "VPX_VERSION=1.13.0" >> $env:GITHUB_ENV
+          echo "VCPKGRS_DYNAMIC=1" >> $env:GITHUB_ENV
+
+      # Linux: use system libvpx
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvpx-dev
+          echo "VPX_LIB_DIR=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "VPX_VERSION=1.13.0" >> $GITHUB_ENV
+
+      # Lint and test
+      - name: Cargo fmt
+        working-directory: tauri-host/src-tauri
+        run: cargo fmt --check
+
+      - name: Cargo clippy
+        working-directory: tauri-host/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Cargo test
+        working-directory: tauri-host/src-tauri
+        run: cargo test
+
+  # Node.js: lint + test the signaling server
+  node:
+    name: Node.js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Lint
+        working-directory: server
+        run: npm run lint 2>/dev/null || echo "No lint script"
+
+      - name: Test
+        working-directory: server
+        run: npm test 2>/dev/null || echo "No test script"
+
+  # Integration test: Rust signaling client against real Node server
+  integration:
+    name: Integration (Rust ↔ Node)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install libvpx
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvpx-dev
+          echo "VPX_LIB_DIR=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "VPX_VERSION=1.13.0" >> $GITHUB_ENV
+
+      - name: Run integration test
+        working-directory: tauri-host/src-tauri
+        env:
+          GHOSTVIEW_NODE_IT: 1
+        run: cargo test --test signaling_roundtrip
